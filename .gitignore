@@ -1,0 +1,5 @@
+.DS_Store
+/target
+/k8s
+log*
+data/

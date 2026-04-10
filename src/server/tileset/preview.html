@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>__TILESET_ID__ - Ishikari preview</title>
+        <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@__MAPLIBRE_GL_VERSION__/dist/maplibre-gl.css" />
+        <script src="https://unpkg.com/maplibre-gl@__MAPLIBRE_GL_VERSION__/dist/maplibre-gl.js"></script>
+        <style>
+            html,
+            body,
+            #map {
+                height: 100%;
+                margin: 0;
+            }
+            .overlay {
+                position: absolute;
+                top: 12px;
+                left: 12px;
+                z-index: 1;
+                background: rgba(255, 255, 255, 0.92);
+                padding: 8px 10px;
+                border-radius: 6px;
+                font: 12px/1.4 sans-serif;
+            }
+            .feature-popup .maplibregl-popup-content {
+                max-width: 320px;
+                padding: 8px 10px;
+                font: 11px/1.35 monospace;
+                background: rgba(255, 255, 255, 0.72);
+                border: 1px solid rgba(255, 255, 255, 0.45);
+                box-shadow: 0 8px 24px rgba(0, 0, 0, 0.14);
+                backdrop-filter: blur(10px) saturate(1.1);
+                -webkit-backdrop-filter: blur(10px) saturate(1.1);
+            }
+            .feature-popup .maplibregl-popup-tip {
+                border-top-color: rgba(255, 255, 255, 0.72);
+                border-bottom-color: rgba(255, 255, 255, 0.72);
+            }
+            .feature-popup h3 {
+                margin: 0 0 6px;
+                font: 600 12px/1.3 sans-serif;
+            }
+            .feature-popup .geometry-type {
+                margin-left: 6px;
+                color: rgba(0, 0, 0, 0.48);
+                font: 400 11px/1.3 sans-serif;
+            }
+            .feature-popup table {
+                width: 100%;
+                border-collapse: collapse;
+            }
+            .feature-popup .feature-item + .feature-item {
+                margin-top: 8px;
+                padding-top: 8px;
+                border-top: 1px solid rgba(0, 0, 0, 0.1);
+            }
+            .feature-popup td {
+                padding: 0;
+                vertical-align: top;
+                word-break: normal;
+                overflow-wrap: normal;
+                hyphens: none;
+            }
+            .feature-popup td:first-child {
+                width: 42%;
+                padding-right: 8px;
+                color: #555;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="overlay">tileset: <strong>__TILESET_ID__</strong></div>
+        <div id="map"></div>
+        <script>
+            const map = new maplibregl.Map({
+                container: "map",
+                style: "__STYLE_URL__",
+                hash: true,
+            });
+            map.showTileBoundaries = true;
+            const popup = new maplibregl.Popup({
+                closeButton: false,
+                closeOnClick: false,
+                className: "feature-popup",
+                offset: 8,
+            });
+            let hoveredFeatures = [];
+            map.addControl(new maplibregl.NavigationControl(), "top-right");
+
+            function escapeHtml(value) {
+                return String(value)
+                    .replaceAll("&", "&amp;")
+                    .replaceAll("<", "&lt;")
+                    .replaceAll(">", "&gt;")
+                    .replaceAll('"', "&quot;")
+                    .replaceAll("'", "&#39;");
+            }
+
+            function popupFeatureHtml(feature) {
+                const properties = feature.properties ?? {};
+                const title = escapeHtml(feature.sourceLayer ?? "feature");
+                const geometryType = escapeHtml(feature.geometry?.type ?? "");
+                const rows = [["id", feature.id ?? ""], ...Object.entries(properties)]
+                    .map(([key, value]) => `<tr><td>${escapeHtml(key)}</td><td>${escapeHtml(value ?? "")}</td></tr>`)
+                    .join("");
+                return `<div class="feature-item"><h3>${title}<span class="geometry-type">${geometryType}</span></h3><table>${rows}</table></div>`;
+            }
+
+            function popupHtml(features) {
+                return features.map((feature) => popupFeatureHtml(feature)).join("");
+            }
+
+            function popupFeatureKey(feature) {
+                return [
+                    feature.source ?? "",
+                    feature.sourceLayer ?? "",
+                    feature.id ?? "",
+                    feature.geometry?.type ?? "",
+                ].join("\u0000");
+            }
+
+            function uniquePopupFeatures(features) {
+                const seen = new Set();
+                return features.filter((feature) => {
+                    const key = popupFeatureKey(feature);
+                    if (seen.has(key)) {
+                        return false;
+                    }
+                    seen.add(key);
+                    return true;
+                });
+            }
+
+            function clearHoveredFeatures() {
+                if (!hoveredFeatures.length) {
+                    return;
+                }
+                for (const feature of hoveredFeatures) {
+                    map.removeFeatureState(feature, "hover");
+                }
+                hoveredFeatures = [];
+            }
+
+            function hoveredFeatureKey(feature) {
+                return [feature.source ?? "", feature.sourceLayer ?? "", feature.id ?? ""].join("\u0000");
+            }
+
+            function setHoveredFeatures(features) {
+                clearHoveredFeatures();
+                const seen = new Set();
+                hoveredFeatures = features
+                    .filter((feature) => feature.id !== undefined && feature.id !== null)
+                    .filter((feature) => {
+                        const key = hoveredFeatureKey(feature);
+                        if (seen.has(key)) {
+                            return false;
+                        }
+                        seen.add(key);
+                        return true;
+                    })
+                    .map((feature) => ({
+                        source: feature.source,
+                        sourceLayer: feature.sourceLayer,
+                        id: feature.id,
+                    }));
+                for (const feature of hoveredFeatures) {
+                    map.setFeatureState(feature, { hover: true });
+                }
+            }
+
+            map.on("mousemove", (event) => {
+                const features = map
+                    .queryRenderedFeatures(event.point)
+                    .filter(
+                        (candidate) =>
+                            candidate.layer.id !== "background" && !candidate.layer.id.startsWith("hovered-feature"),
+                    );
+                if (!features.length) {
+                    clearHoveredFeatures();
+                    popup.remove();
+                    map.getCanvas().style.cursor = "";
+                    return;
+                }
+
+                setHoveredFeatures(features);
+                map.getCanvas().style.cursor = "pointer";
+                popup
+                    .setLngLat(event.lngLat)
+                    .setHTML(popupHtml(uniquePopupFeatures(features)))
+                    .addTo(map);
+            });
+
+            map.on("mouseout", () => {
+                clearHoveredFeatures();
+                popup.remove();
+                map.getCanvas().style.cursor = "";
+            });
+        </script>
+    </body>
+</html>
