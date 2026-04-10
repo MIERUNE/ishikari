@@ -3,3 +3,4 @@
 /k8s
 log*
 data/
+.claude/settings.local.json

@@ -73,7 +73,9 @@ impl Membership {
             },
             marked_for_deletion_grace_period: Duration::from_secs(30),
             catchup_callback: None,
-            extra_liveness_predicate: None,
+            extra_liveness_predicate: Some(Box::new(|node_state| {
+                node_state.get(DRAINING_KEY) != Some("true")
+            })),
         };
         let initial_key_values = vec![
             (HTTP_PORT_KEY.to_string(), config.http_port.to_string()),
@@ -110,7 +112,8 @@ impl Membership {
                     .node_states()
                     .iter()
                     .find(|(peer_id, _)| peer_id.node_id == node_id)
-                    .and_then(|(_, node_state)| parse_draining(node_state))
+                    .and_then(|(_, node_state)| node_state.get(DRAINING_KEY))
+                    .map(|v| v == "true")
                     .unwrap_or(false)
             })
             .await
@@ -200,7 +203,6 @@ impl Membership {
 fn collect_live_peers_from_nodes(live_nodes: &BTreeMap<ChitchatId, NodeState>) -> Vec<Peer> {
     let mut peers: Vec<_> = live_nodes
         .iter()
-        .filter(|(_, node_state)| !parse_draining(node_state).unwrap_or(false))
         .map(|(peer_id, node_state)| {
             let http_port = node_state
                 .get(HTTP_PORT_KEY)
@@ -215,13 +217,4 @@ fn collect_live_peers_from_nodes(live_nodes: &BTreeMap<ChitchatId, NodeState>) -
         .collect();
     peers.sort_by(|left, right| left.id.cmp(&right.id));
     peers
-}
-
-/// Parses the optional draining flag from a node state.
-fn parse_draining(node_state: &NodeState) -> Option<bool> {
-    node_state.get(DRAINING_KEY).and_then(|value| match value {
-        "true" => Some(true),
-        "false" => Some(false),
-        _ => None,
-    })
 }
