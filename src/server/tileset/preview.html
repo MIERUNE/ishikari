@@ -87,6 +87,8 @@
             });
             let hoveredFeatures = [];
             map.addControl(new maplibregl.NavigationControl(), "top-right");
+            map.addControl(new maplibregl.GlobeControl(), "top-right");
+            __TERRAIN_CONTROL__
 
             function escapeHtml(value) {
                 return String(value)

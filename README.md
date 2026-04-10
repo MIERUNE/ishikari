@@ -1,9 +1,9 @@
-# ishikari
+# Ishikari
+
+A distributed cache proxy for serving tiles from [PMTiles](https://github.com/protomaps/PMTiles) archives in object storage.
 
 > [!NOTE]
 > This project is in early stages of development.
-
-A distributed cache proxy for serving tiles from [PMTiles](https://github.com/protomaps/PMTiles) archives in object storage.
 
 Designed for large-scale tile serving deployments:
 

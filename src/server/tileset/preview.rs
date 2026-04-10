@@ -4,16 +4,18 @@ use std::hash::Hasher;
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::Html,
 };
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::debug;
 use twox_hash::XxHash64;
 
 use crate::{
     interned_str::TilesetId,
+    pmtiles::TileType,
     server::{AppState, HttpError, get_origin},
     tilesets::{TilesetInfo, validate_tileset_id},
 };
@@ -23,15 +25,44 @@ use super::error::tileset_error_response;
 const MAPLIBRE_GL_VERSION: &str = "latest";
 const PREVIEW_HTML_TEMPLATE: &str = include_str!("preview.html");
 
+#[derive(Deserialize)]
+pub(crate) struct PreviewQuery {
+    encoding: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum DemEncoding {
+    Terrarium,
+    TerrainRgb,
+}
+
+impl DemEncoding {
+    fn from_str(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "terrarium" => Some(Self::Terrarium),
+            "terrainrgb" => Some(Self::TerrainRgb),
+            _ => None,
+        }
+    }
+
+    fn maplibre_encoding(self) -> &'static str {
+        match self {
+            Self::Terrarium => "terrarium",
+            Self::TerrainRgb => "mapbox",
+        }
+    }
+}
+
 /// Serves the lightweight HTML preview shell for a tileset.
 pub(crate) async fn preview_handler(
     State(_state): State<AppState>,
     Path(tileset_id): Path<String>,
+    Query(query): Query<PreviewQuery>,
 ) -> Result<Html<String>, HttpError> {
     let tileset_id = TilesetId::from(tileset_id);
     validate_tileset_id(tileset_id.as_ref())
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-    let html = preview_html(&tileset_id);
+    let html = preview_html(&tileset_id, query.encoding.as_deref());
     debug!(
         endpoint = "preview",
         tileset_id = %tileset_id,
@@ -46,6 +77,7 @@ pub(crate) async fn preview_style_handler(
     State(state): State<AppState>,
     Path(tileset_id): Path<String>,
     headers: HeaderMap,
+    Query(query): Query<PreviewQuery>,
 ) -> Result<Json<Value>, HttpError> {
     let tileset_id = TilesetId::from(tileset_id);
     let base_url = get_origin(&headers);
@@ -55,7 +87,7 @@ pub(crate) async fn preview_style_handler(
         .await
         .map_err(tileset_error_response)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "not found".to_string()))?;
-    let style = preview_style(&tileset_id, &base_url, &info);
+    let style = preview_style(&tileset_id, &base_url, &info, query.encoding.as_deref());
     debug!(
         endpoint = "preview_style",
         tileset_id = %tileset_id,
@@ -64,15 +96,106 @@ pub(crate) async fn preview_style_handler(
     Ok(Json(style))
 }
 
-fn preview_html(tileset_id: &TilesetId) -> String {
-    let style_url = format!("/tilesets/{tileset_id}/preview.json");
+fn preview_html(tileset_id: &TilesetId, encoding: Option<&str>) -> String {
+    let style_url = match encoding {
+        Some(enc) => format!("/tilesets/{tileset_id}/preview.json?encoding={enc}"),
+        None => format!("/tilesets/{tileset_id}/preview.json"),
+    };
+    let terrain_control = if encoding.and_then(DemEncoding::from_str).is_some() {
+        r#"map.addControl(new maplibregl.TerrainControl({ source: "dem", exaggeration: 1.0 }), "top-right");"#
+    } else {
+        ""
+    };
     PREVIEW_HTML_TEMPLATE
         .replace("__TILESET_ID__", tileset_id)
         .replace("__STYLE_URL__", &style_url)
         .replace("__MAPLIBRE_GL_VERSION__", MAPLIBRE_GL_VERSION)
+        .replace("__TERRAIN_CONTROL__", terrain_control)
 }
 
-fn preview_style(tileset_id: &TilesetId, base_url: &str, info: &TilesetInfo) -> Value {
+fn preview_style(
+    tileset_id: &TilesetId,
+    base_url: &str,
+    info: &TilesetInfo,
+    encoding: Option<&str>,
+) -> Value {
+    match info.header.tile_type {
+        TileType::Png | TileType::Jpeg | TileType::Webp | TileType::Avif => {
+            if let Some(dem) = encoding.and_then(DemEncoding::from_str) {
+                preview_style_dem(tileset_id, base_url, info, dem)
+            } else {
+                preview_style_raster(tileset_id, base_url, info)
+            }
+        }
+        _ => preview_style_vector(tileset_id, base_url, info),
+    }
+}
+
+fn preview_style_dem(
+    tileset_id: &TilesetId,
+    base_url: &str,
+    info: &TilesetInfo,
+    encoding: DemEncoding,
+) -> Value {
+    json!({
+        "version": 8,
+        "name": format!("preview - {tileset_id}"),
+        "center": [info.header.center_longitude, info.header.center_latitude],
+        "zoom": info.header.center_zoom,
+        "sources": {
+            "dem": {
+                "type": "raster-dem",
+                "tiles": [format!("{base_url}/tilesets/{tileset_id}/{{z}}/{{x}}/{{y}}")],
+                "minzoom": info.header.min_zoom,
+                "maxzoom": info.header.max_zoom,
+                "tileSize": 256,
+                "encoding": encoding.maplibre_encoding()
+            }
+        },
+        "layers": [
+            {
+                "id": "background",
+                "type": "background",
+                "paint": { "background-color": "white" }
+            },
+            {
+                "id": "hillshade",
+                "type": "hillshade",
+                "source": "dem",
+                "paint": {
+                    "hillshade-shadow-color": "#5a331f"
+                }
+            }
+        ]
+    })
+}
+
+fn preview_style_raster(tileset_id: &TilesetId, base_url: &str, info: &TilesetInfo) -> Value {
+    json!({
+        "version": 8,
+        "name": format!("preview - {tileset_id}"),
+        "center": [info.header.center_longitude, info.header.center_latitude],
+        "zoom": info.header.center_zoom,
+        "sources": {
+            "preview": {
+                "type": "raster",
+                "tiles": [format!("{base_url}/tilesets/{tileset_id}/{{z}}/{{x}}/{{y}}")],
+                "minzoom": info.header.min_zoom,
+                "maxzoom": info.header.max_zoom,
+                "tileSize": 256
+            }
+        },
+        "layers": [
+            {
+                "id": "raster",
+                "type": "raster",
+                "source": "preview"
+            }
+        ]
+    })
+}
+
+fn preview_style_vector(tileset_id: &TilesetId, base_url: &str, info: &TilesetInfo) -> Value {
     let vector_layers = info.metadata.vector_layers();
     let mut layers = vec![json!({
         "id": "background",
@@ -221,7 +344,7 @@ fn preview_style(tileset_id: &TilesetId, base_url: &str, info: &TilesetInfo) -> 
 
     json!({
         "version": 8,
-        "name": format!("preview preview - {tileset_id}"),
+        "name": format!("preview - {tileset_id}"),
         "glyphs": "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf",
         "center": [info.header.center_longitude, info.header.center_latitude],
         "zoom": info.header.center_zoom,
