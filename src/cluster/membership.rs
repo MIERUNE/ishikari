@@ -3,19 +3,22 @@
 use std::{
     collections::BTreeMap,
     net::SocketAddr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
 use chitchat::{
-    ChitchatConfig, ChitchatHandle, ChitchatId, ClusterStateSnapshot, FailureDetectorConfig,
-    NodeState, spawn_chitchat, transport::UdpTransport,
+    ChitchatConfig, ChitchatHandle, ChitchatId, FailureDetectorConfig, NodeState, spawn_chitchat,
+    transport::UdpTransport,
 };
 use tracing::info;
 
 const CLUSTER_ID: &str = "ishikari";
-const HTTP_PORT_KEY: &str = "http_port";
+const HTTP_PORT_KEY: &str = "http-port";
 const DRAINING_KEY: &str = "draining";
 const DEFAULT_HTTP_PORT: u16 = 8080;
 
@@ -34,15 +37,22 @@ pub struct MembershipConfig {
 pub struct Membership {
     node_id: String,
     handle: Arc<ChitchatHandle>,
+    ready: Arc<AtomicBool>,
 }
 
 /// Snapshot of the current cluster state exposed by the HTTP API.
 #[derive(serde::Serialize)]
 pub struct ClusterView {
     pub cluster_id: String,
-    pub cluster_state: ClusterStateSnapshot,
+    pub nodes: BTreeMap<String, NodeView>,
     pub live_ids: Vec<String>,
     pub dead_ids: Vec<String>,
+}
+
+/// Per-node snapshot containing the gossip key-value pairs.
+#[derive(serde::Serialize)]
+pub struct NodeView {
+    pub key_values: BTreeMap<String, String>,
 }
 
 /// Reachable peer information derived from membership gossip state.
@@ -68,10 +78,10 @@ impl Membership {
             listen_addr: config.listen_addr,
             seed_nodes: config.seed_nodes,
             failure_detector_config: FailureDetectorConfig {
-                dead_node_grace_period: Duration::from_secs(10),
+                dead_node_grace_period: Duration::from_secs(30),
                 ..FailureDetectorConfig::default()
             },
-            marked_for_deletion_grace_period: Duration::from_secs(30),
+            marked_for_deletion_grace_period: Duration::from_hours(1),
             catchup_callback: None,
             extra_liveness_predicate: Some(Box::new(|node_state| {
                 node_state.get(DRAINING_KEY) != Some("true")
@@ -81,15 +91,18 @@ impl Membership {
             (HTTP_PORT_KEY.to_string(), config.http_port.to_string()),
             (DRAINING_KEY.to_string(), "false".to_string()),
         ];
+        let has_seeds = !chitchat_config.seed_nodes.is_empty();
         let handle = spawn_chitchat(chitchat_config, initial_key_values, &UdpTransport)
             .await
             .context("failed to start chitchat")?;
+        let ready = Arc::new(AtomicBool::new(!has_seeds));
         let membership = Self {
             node_id: config.node_id,
             handle: Arc::new(handle),
+            ready,
         };
 
-        membership.spawn_logger().await;
+        membership.spawn_membership_watcher().await;
 
         Ok(membership)
     }
@@ -101,6 +114,11 @@ impl Membership {
                 chitchat.self_node_state().set(DRAINING_KEY, draining);
             })
             .await;
+    }
+
+    /// Returns whether this node has joined the cluster.
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Relaxed)
     }
 
     /// Returns whether this node currently advertises a draining state.
@@ -130,6 +148,21 @@ impl Membership {
     pub async fn cluster_view(&self) -> ClusterView {
         self.handle
             .with_chitchat(|chitchat| {
+                let snapshot = chitchat.state_snapshot();
+
+                let nodes = snapshot
+                    .node_states
+                    .iter()
+                    .map(|node_state| {
+                        let id = node_state.chitchat_id().node_id.clone();
+                        let key_values = node_state
+                            .key_values()
+                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                            .collect();
+                        (id, NodeView { key_values })
+                    })
+                    .collect();
+
                 let mut live_ids: Vec<_> = chitchat
                     .live_nodes()
                     .map(|node| node.node_id.clone())
@@ -144,7 +177,7 @@ impl Membership {
 
                 ClusterView {
                     cluster_id: chitchat.cluster_id().to_string(),
-                    cluster_state: chitchat.state_snapshot(),
+                    nodes,
                     live_ids,
                     dead_ids,
                 }
@@ -170,17 +203,34 @@ impl Membership {
             .await
     }
 
-    /// Spawns a background task that logs membership changes.
-    async fn spawn_logger(&self) {
+    /// Sets multiple key-value pairs on the self node's chitchat state.
+    pub async fn set_many(&self, kvs: &[(&str, String)]) {
+        self.handle
+            .with_chitchat(|chitchat| {
+                let state = chitchat.self_node_state();
+                for (key, value) in kvs {
+                    state.set(*key, value.as_str());
+                }
+            })
+            .await;
+    }
+
+    /// Spawns a background task that tracks membership changes and readiness.
+    async fn spawn_membership_watcher(&self) {
         let mut live_nodes = self
             .handle
             .with_chitchat(|chitchat| chitchat.live_nodes_watcher())
             .await;
         let node_id = self.node_id.clone();
+        let ready = self.ready.clone();
 
         tokio::spawn(async move {
             loop {
                 let peers = collect_live_peers_from_nodes(&live_nodes.borrow());
+                if !ready.load(Ordering::Relaxed) && peers.iter().any(|peer| peer.id != node_id) {
+                    ready.store(true, Ordering::Relaxed);
+                    info!(node_id = %node_id, "node is ready");
+                }
                 let peers_str = format!(
                     "[{}]",
                     peers

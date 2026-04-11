@@ -10,6 +10,7 @@ use url::Url;
 
 use crate::{
     interned_str::InternedStr,
+    metrics::NodeMetrics,
 };
 
 use super::{
@@ -31,6 +32,7 @@ pub struct ChunkedStore {
     chunk_size_bytes: u64,
     max_fetch_chunks: u64,
     backend_fetch_delay: Duration,
+    metrics: NodeMetrics,
 }
 
 impl ChunkedStore {
@@ -42,6 +44,7 @@ impl ChunkedStore {
         max_fetch_chunks: u64,
         backend_fetch_delay_ms: u64,
         chunk_cache_max_bytes: u64,
+        metrics: NodeMetrics,
     ) -> Result<Self> {
         let url = normalize_data_url(&data_url)?;
         let (object_store, base_path) = parse_url_opts(&url, std::env::vars())
@@ -57,6 +60,7 @@ impl ChunkedStore {
             chunk_size_bytes,
             max_fetch_chunks,
             backend_fetch_delay: Duration::from_millis(backend_fetch_delay_ms),
+            metrics,
         })
     }
 
@@ -178,6 +182,11 @@ impl ChunkedStore {
         tokio::time::sleep(self.backend_fetch_delay).await;
     }
 
+    /// Returns the current weighted byte size of the chunk cache.
+    pub fn chunk_cache_weighted_size(&self) -> u64 {
+        self.chunk_cache.weighted_size()
+    }
+
     /// Resolves an interned tileset id into an object-store path.
     fn object_path(&self, tileset_id: &InternedStr) -> ObjectPath {
         self.base_path.clone().join(format!("{tileset_id}.pmtiles"))
@@ -244,6 +253,7 @@ impl ChunkFetchBackend for ChunkedStore {
                         bytes.len()
                     )));
                 }
+                self.metrics.add_backend_bytes(bytes.len() as u64);
                 debug!(
                     node_id = %self.node_id,
                     tileset_id = %tileset_id,

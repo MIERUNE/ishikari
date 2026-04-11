@@ -40,7 +40,7 @@ pub struct Cli {
     data_url: String,
     #[arg(long, env = "ROUTER_TOP_K", default_value_t = 3)]
     router_candidate_count: usize,
-    #[arg(long, env = "ROUTER_TILE_GROUP_SIZE", default_value_t = 1024)]
+    #[arg(long, env = "ROUTER_TILE_GROUP_SIZE", default_value_t = 512)]
     router_tile_group_size: u64,
     #[arg(long, env = "GOSSIP_INTERVAL_MS", default_value_t = 200)]
     gossip_interval_ms: u64,

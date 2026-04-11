@@ -16,6 +16,7 @@ use crate::{
         router::HrwRouter,
     },
     interned_str::TilesetId,
+    metrics::NodeMetrics,
     pmtiles::{Header, Metadata, Reader as PmtilesReader, TileData},
     storage::{ChunkedStore, DistributedStorage, PeerBackend, PeerFetchError},
 };
@@ -49,6 +50,7 @@ pub struct TilesetServiceConfig {
     pub backend_fetch_delay_ms: u64,
     pub tile_cache_max_bytes: u64,
     pub chunk_cache_max_bytes: u64,
+    pub metrics: NodeMetrics,
 }
 
 /// High-level tileset service that combines routing, forwarding, and caches.
@@ -58,6 +60,7 @@ pub struct TilesetService {
     pmtiles: Arc<PmtilesReader<DistributedStorage>>,
     resource_cache: ResourceCache,
     tile_cache: TileCache,
+    chunked_store: ChunkedStore,
 }
 
 enum CachedTileLookup {
@@ -89,8 +92,10 @@ impl TilesetService {
             config.max_fetch_chunks,
             config.backend_fetch_delay_ms,
             config.chunk_cache_max_bytes,
+            config.metrics,
         )?;
-        let pmtiles_storage = DistributedStorage::new(chunked_store, peer_backend.clone());
+        let pmtiles_storage =
+            DistributedStorage::new(chunked_store.clone(), peer_backend.clone());
         let pmtiles = Arc::new(PmtilesReader::new(pmtiles_storage)?);
         Ok(Self {
             self_node_id: config.self_node_id,
@@ -98,7 +103,18 @@ impl TilesetService {
             pmtiles,
             resource_cache: ResourceCache::new(RESOURCE_CACHE_MAX_BYTES),
             tile_cache: TileCache::new(config.tile_cache_max_bytes),
+            chunked_store,
         })
+    }
+
+    /// Returns the current weighted byte sizes of the tile and chunk caches.
+    pub fn tile_cache_weighted_size(&self) -> u64 {
+        self.tile_cache.weighted_size()
+    }
+
+    /// Returns the current weighted byte size of the chunk cache.
+    pub fn chunk_cache_weighted_size(&self) -> u64 {
+        self.chunked_store.chunk_cache_weighted_size()
     }
 
     /// Serves an external tile request addressed by PMTiles tile id.

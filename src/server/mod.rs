@@ -2,7 +2,7 @@
 
 use std::{future::Future, net::SocketAddr, sync::Arc};
 
-use crate::{cluster::membership::Membership, server, tilesets::TilesetService};
+use crate::{cluster::membership::Membership, metrics::NodeMetrics, server, tilesets::TilesetService};
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
@@ -17,13 +17,19 @@ pub(crate) type HttpError = (StatusCode, String);
 #[derive(Clone)]
 pub struct AppState {
     membership: Membership,
+    pub(crate) metrics: NodeMetrics,
     tileset_service: Arc<TilesetService>,
 }
 
 impl AppState {
-    pub fn new(membership: Membership, tileset_service: Arc<TilesetService>) -> Self {
+    pub fn new(
+        membership: Membership,
+        metrics: NodeMetrics,
+        tileset_service: Arc<TilesetService>,
+    ) -> Self {
         Self {
             membership,
+            metrics,
             tileset_service,
         }
     }
@@ -37,7 +43,8 @@ pub async fn run_http_server(
     let app = Router::new()
         .route("/", get(root))
         .route("/_internal/cluster", get(cluster_handler))
-        .route("/healthz", get(healthz))
+        .route("/livez", get(livez))
+        .route("/readyz", get(readyz))
         .route(
             "/tilesets/{tileset_id}",
             get(server::tileset::tilejson_handler),
@@ -104,9 +111,14 @@ pub(crate) fn get_origin(headers: &HeaderMap) -> String {
     format!("{scheme}://{host}")
 }
 
-/// Reports whether this node is ready to receive new traffic.
-async fn healthz(State(state): State<AppState>) -> StatusCode {
-    if state.membership.is_draining().await {
+/// Reports whether this node process is alive.
+async fn livez() -> StatusCode {
+    StatusCode::OK
+}
+
+/// Reports whether this node is ready to receive traffic.
+async fn readyz(State(state): State<AppState>) -> StatusCode {
+    if !state.membership.is_ready() || state.membership.is_draining().await {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::OK

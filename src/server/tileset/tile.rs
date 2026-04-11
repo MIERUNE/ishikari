@@ -35,6 +35,7 @@ pub(crate) async fn tile_handler(
         .await
         .map_err(tileset_error_response)?
         .map(|tile| {
+            state.metrics.add_egress_bytes(tile.bytes.len() as u64);
             debug!(
                 endpoint = "tile",
                 served_bytes = tile.bytes.len(),
@@ -57,6 +58,7 @@ pub(crate) async fn internal_tile_handler(
         .await
         .map_err(tileset_error_response)?
         .map(|tile| {
+            state.metrics.add_internal_bytes(tile.bytes.len() as u64);
             debug!(
                 endpoint = "internal_tile",
                 served_bytes = tile.bytes.len(),

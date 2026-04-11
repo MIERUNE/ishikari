@@ -30,6 +30,7 @@ pub(crate) async fn internal_archive_index_handler(
         .await
         .map_err(tileset_error_response)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "not found".to_string()))?;
+    state.metrics.add_internal_bytes(archive.len() as u64);
     if tracing::enabled!(tracing::Level::DEBUG) {
         debug!(
             endpoint = "internal_archive_index",
@@ -59,6 +60,7 @@ pub(crate) async fn internal_metadata_handler(
         .await
         .map_err(tileset_error_response)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "not found".to_string()))?;
+    state.metrics.add_internal_bytes(metadata.len() as u64);
     if tracing::enabled!(tracing::Level::DEBUG) {
         debug!(
             endpoint = "internal_metadata",
@@ -88,6 +90,7 @@ pub(crate) async fn internal_leaf_handler(
         .await
         .map_err(tileset_error_response)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "not found".to_string()))?;
+    state.metrics.add_internal_bytes(leaf.len() as u64);
     if tracing::enabled!(tracing::Level::DEBUG) {
         debug!(
             endpoint = "internal_leaf",

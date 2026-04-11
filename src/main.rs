@@ -7,11 +7,13 @@ use tracing_subscriber::{EnvFilter, fmt};
 use ishikari::{
     cluster::membership::Membership,
     config::Config,
+    metrics::NodeMetrics,
     server::{AppState, run_http_server},
     tilesets::{TilesetService, TilesetServiceConfig},
 };
 
 const DRAINING_PROPAGATION_DELAY: Duration = Duration::from_secs(2);
+const STATS_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -44,6 +46,7 @@ async fn main() -> Result<()> {
     );
 
     let membership = Membership::spawn(config.membership).await?;
+    let metrics = NodeMetrics::new();
 
     let tileset_service = Arc::new(
         TilesetService::new(TilesetServiceConfig {
@@ -57,12 +60,15 @@ async fn main() -> Result<()> {
             backend_fetch_delay_ms: config.backend_fetch_delay_ms,
             tile_cache_max_bytes: config.tile_cache_max_bytes,
             chunk_cache_max_bytes: config.chunk_cache_max_bytes,
+            metrics: metrics.clone(),
         })
         .await?,
     );
 
+    spawn_stats_reporter(membership.clone(), tileset_service.clone(), metrics.clone());
+
     run_http_server(
-        AppState::new(membership.clone(), tileset_service),
+        AppState::new(membership.clone(), metrics, tileset_service),
         config.http_listen_addr,
         shutdown_signal(membership.clone()),
     )
@@ -91,4 +97,41 @@ async fn wait_for_shutdown_signal() {
         _ = tokio::signal::ctrl_c() => {}
         _ = terminate => {}
     }
+}
+
+fn spawn_stats_reporter(
+    membership: Membership,
+    tileset_service: Arc<TilesetService>,
+    metrics: NodeMetrics,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(STATS_REPORT_INTERVAL);
+        loop {
+            ticker.tick().await;
+            membership
+                .set_many(&[
+                    (
+                        "cache-tile-bytes",
+                        tileset_service.tile_cache_weighted_size().to_string(),
+                    ),
+                    (
+                        "cache-chunk-bytes",
+                        tileset_service.chunk_cache_weighted_size().to_string(),
+                    ),
+                    (
+                        "transfer-external-bytes",
+                        metrics.egress_bytes().to_string(),
+                    ),
+                    (
+                        "transfer-internal-bytes",
+                        metrics.internal_bytes().to_string(),
+                    ),
+                    (
+                        "transfer-backend-bytes",
+                        metrics.backend_bytes().to_string(),
+                    ),
+                ])
+                .await;
+        }
+    });
 }

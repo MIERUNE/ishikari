@@ -49,6 +49,11 @@ impl ChunkCache {
     pub fn put(&self, key: ChunkCacheKey, data: Bytes) {
         self.cache.insert(key, data);
     }
+
+    /// Returns the current weighted byte size of the chunk cache.
+    pub fn weighted_size(&self) -> u64 {
+        self.cache.weighted_size()
+    }
 }
 
 /// Estimates the weight of a cached chunk entry.

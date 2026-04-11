@@ -88,6 +88,11 @@ impl TileCache {
     pub fn put(&self, key: TileCacheKey, value: CachedTile) {
         self.cache.insert(key, value);
     }
+
+    /// Returns the current weighted byte size of the tile cache.
+    pub fn weighted_size(&self) -> u64 {
+        self.cache.weighted_size()
+    }
 }
 
 impl ResourceCache {
