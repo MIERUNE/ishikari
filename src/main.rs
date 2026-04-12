@@ -31,7 +31,6 @@ async fn main() -> Result<()> {
     // Load configuration
     let config = Config::load();
     info!(
-        node_id = %config.node_id,
         http_listen_addr = %config.http_listen_addr,
         http_port = config.http_port,
         listen_addr = %config.membership.listen_addr,

@@ -4,12 +4,15 @@ use std::{collections::BTreeSet, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
 use bytes::{Bytes, BytesMut};
-use object_store::{ObjectStore, ObjectStoreExt, parse_url_opts, path::Path as ObjectPath};
+use object_store::{
+    Error as ObjectStoreError, ObjectStore, ObjectStoreExt, parse_url_opts,
+    path::Path as ObjectPath,
+};
 use tracing::debug;
 use url::Url;
 
 use crate::{
-    interned_str::InternedStr,
+    interned_str::{InternedStr, TilesetId},
     metrics::NodeMetrics,
 };
 
@@ -24,7 +27,6 @@ const BACKEND_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// Chunked byte-range reader backed by an object store.
 #[derive(Clone)]
 pub struct ChunkedStore {
-    node_id: String,
     object_store: Arc<dyn ObjectStore>,
     base_path: ObjectPath,
     chunk_cache: ChunkCache,
@@ -38,7 +40,6 @@ pub struct ChunkedStore {
 impl ChunkedStore {
     /// Creates a chunked object-store reader rooted at the configured data URL.
     pub fn new(
-        node_id: String,
         data_url: String,
         chunk_size_bytes: u64,
         max_fetch_chunks: u64,
@@ -52,7 +53,6 @@ impl ChunkedStore {
         let object_store: Arc<dyn ObjectStore> = object_store.into();
 
         Ok(Self {
-            node_id,
             object_store,
             base_path,
             chunk_cache: ChunkCache::new(chunk_cache_max_bytes),
@@ -62,11 +62,6 @@ impl ChunkedStore {
             backend_fetch_delay: Duration::from_millis(backend_fetch_delay_ms),
             metrics,
         })
-    }
-
-    /// Returns the local node identifier used by backend logs.
-    pub fn node_id(&self) -> &str {
-        &self.node_id
     }
 
     /// Returns the configured fixed chunk size in bytes.
@@ -83,7 +78,7 @@ impl ChunkedStore {
     /// Reads a tileset byte range through the shared chunk cache and inflight fetcher.
     pub async fn read_bytes(
         &self,
-        tileset_id: &InternedStr,
+        tileset_id: &TilesetId,
         start: u64,
         length: usize,
         archive_len: Option<u64>,
@@ -105,9 +100,8 @@ impl ChunkedStore {
                 .last()
                 .expect("missing_chunks must be non-empty here");
             let fetch_end =
-                archive_len.unwrap_or_else(|| chunk_end(last_missing_chunk, self.chunk_size_bytes));
-            self.fetch_aggregator
-                .ensure_chunks((*self).clone(), tileset_id, &missing_chunks, fetch_end)
+                archive_len.unwrap_or_else(|| (last_missing_chunk + 1) * self.chunk_size_bytes);
+            self.ensure_chunks(tileset_id, &missing_chunks, fetch_end)
                 .await?;
         }
 
@@ -118,19 +112,28 @@ impl ChunkedStore {
     /// Ensures the required chunks are present locally before a range is reconstructed.
     pub async fn ensure_chunks(
         &self,
-        tileset_id: &InternedStr,
+        tileset_id: &TilesetId,
         required_chunks: &[u64],
         archive_len: u64,
     ) -> std::result::Result<(), ChunkFetchError> {
+        let missing_chunks: Vec<u64> = required_chunks
+            .iter()
+            .copied()
+            .filter(|chunk_index| self.chunk_cache_get(tileset_id, *chunk_index).is_none())
+            .collect();
+        if missing_chunks.is_empty() {
+            return Ok(());
+        }
+
         self.fetch_aggregator
-            .ensure_chunks((*self).clone(), tileset_id, required_chunks, archive_len)
+            .fetch_chunks((*self).clone(), tileset_id, &missing_chunks, archive_len)
             .await
     }
 
     /// Reconstructs a previously fetched byte range from cached chunks.
     pub fn read_cached_bytes(
         &self,
-        tileset_id: &InternedStr,
+        tileset_id: &TilesetId,
         start: u64,
         length: usize,
     ) -> Result<Bytes> {
@@ -188,29 +191,26 @@ impl ChunkedStore {
     }
 
     /// Resolves an interned tileset id into an object-store path.
-    fn object_path(&self, tileset_id: &InternedStr) -> ObjectPath {
+    fn object_path(&self, tileset_id: &TilesetId) -> ObjectPath {
         self.base_path.clone().join(format!("{tileset_id}.pmtiles"))
     }
 }
 
 impl ChunkFetchBackend for ChunkedStore {
-    /// Returns the backend node identifier for chunk fetch logging.
-    fn backend_node_id(&self) -> &str {
-        &self.node_id
+    /// Splits requested chunks into contiguous object-store fetch groups.
+    fn chunk_fetch_groups(&self, chunks: &BTreeSet<u64>) -> Vec<BTreeSet<u64>> {
+        contiguous_chunk_ranges(chunks, self.max_fetch_chunks, MAX_CHUNK_GAP)
+            .into_iter()
+            .map(|(start_chunk, end_chunk)| (start_chunk..end_chunk).collect())
+            .collect()
     }
 
-    /// Returns whether the requested tileset chunk is already cached.
-    fn chunk_present(&self, tileset_id: &InternedStr, chunk_index: u64) -> bool {
-        self.chunk_cache_get(tileset_id, chunk_index).is_some()
-    }
-
-    /// Fetches tileset chunks from object storage into the shared chunk cache.
-    fn fetch_chunk_batch(
+    /// Fetches one tileset chunk group from object storage into the shared chunk cache.
+    fn fetch_chunk_group(
         &self,
-        tileset_id: &InternedStr,
+        tileset_id: &TilesetId,
         chunks: &BTreeSet<u64>,
         archive_len: u64,
-        batch_age_ms: u64,
     ) -> impl std::future::Future<Output = std::result::Result<(), ChunkFetchError>> + Send {
         async move {
             if chunks.is_empty() {
@@ -219,64 +219,78 @@ impl ChunkFetchBackend for ChunkedStore {
 
             let chunk_size_bytes = self.chunk_size_bytes;
             let path = self.object_path(tileset_id);
-            for (start_chunk, end_chunk) in
-                contiguous_chunk_ranges(chunks, self.max_fetch_chunks, MAX_CHUNK_GAP)
-            {
-                let range_start = start_chunk * chunk_size_bytes;
-                let range_end = (end_chunk * chunk_size_bytes).min(archive_len);
-                debug!(
-                    node_id = %self.node_id,
-                    tileset_id = %tileset_id,
-                    start_chunk = start_chunk,
-                    end_chunk = end_chunk,
-                    prefetched_chunks = end_chunk - start_chunk,
-                    prefetched_bytes = range_end - range_start,
-                    batch_age_ms = batch_age_ms,
-                    "fetching backend chunks"
-                );
-                self.sleep_before_backend_fetch().await;
-                let bytes = tokio::time::timeout(
-                    BACKEND_FETCH_TIMEOUT,
-                    self.object_store.get_range(&path, range_start..range_end),
-                )
-                .await
-                .map_err(|error| {
-                    ChunkFetchError::Message(format!(
-                        "timed out fetching chunk range from object store: path={path} range={range_start}..{range_end}: {error}"
-                    ))
-                })?
-                .map_err(ChunkFetchError::from)?;
-                let expected_len = (range_end - range_start) as usize;
-                if bytes.len() != expected_len {
-                    return Err(ChunkFetchError::Message(format!(
-                        "short range read from object store: path={path} range={range_start}..{range_end} expected_bytes={expected_len} actual_bytes={}",
-                        bytes.len()
-                    )));
-                }
-                self.metrics.add_backend_bytes(bytes.len() as u64);
-                debug!(
-                    node_id = %self.node_id,
-                    tileset_id = %tileset_id,
-                    start_chunk = start_chunk,
-                    end_chunk = end_chunk,
-                    backend_fetched_bytes = bytes.len(),
-                    "fetched backend chunk bytes"
-                );
+            let fetch_started_at = std::time::Instant::now();
+            let start_chunk = *chunks
+                .first()
+                .expect("chunk fetch group must contain at least one chunk");
+            let end_chunk = chunks
+                .last()
+                .copied()
+                .expect("chunk fetch group must contain at least one chunk")
+                + 1;
+            let range_start = start_chunk * chunk_size_bytes;
+            let range_end = (end_chunk * chunk_size_bytes).min(archive_len);
+            debug!(
+                tileset_id = %tileset_id,
+                start_chunk = start_chunk,
+                end_chunk = end_chunk,
+                prefetched_chunks = end_chunk - start_chunk,
+                prefetched_bytes = range_end - range_start,
+                "fetching backend chunks"
+            );
+            self.sleep_before_backend_fetch().await;
+            let bytes = tokio::time::timeout(
+                BACKEND_FETCH_TIMEOUT,
+                self.object_store.get_range(&path, range_start..range_end),
+            )
+            .await
+            .map_err(|error| {
+                ChunkFetchError::Message(format!(
+                    "timed out fetching chunk range from object store: path={path} range={range_start}..{range_end}: {error}"
+                ))
+            })?
+            .map_err(ChunkFetchError::from)?;
+            let expected_len = (range_end - range_start) as usize;
+            if bytes.len() != expected_len {
+                return Err(ChunkFetchError::Message(format!(
+                    "short range read from object store: path={path} range={range_start}..{range_end} expected_bytes={expected_len} actual_bytes={}",
+                    bytes.len()
+                )));
+            }
+            self.metrics.add_backend_bytes(bytes.len() as u64);
+            debug!(
+                tileset_id = %tileset_id,
+                start_chunk = start_chunk,
+                end_chunk = end_chunk - 1,
+                backend_fetched_bytes = bytes.len(),
+                duration_ms = fetch_started_at.elapsed().as_millis() as u64,
+                "fetched backend chunk bytes"
+            );
 
-                for chunk_index in start_chunk..end_chunk {
-                    let absolute_start = chunk_index * chunk_size_bytes;
-                    let absolute_end = ((chunk_index + 1) * chunk_size_bytes).min(archive_len);
-                    let relative_start = (absolute_start - range_start) as usize;
-                    let relative_end = (absolute_end - range_start) as usize;
-                    self.chunk_cache.put(
-                        ChunkCacheKey::new(tileset_id, chunk_index),
-                        bytes.slice(relative_start..relative_end),
-                    );
-                }
+            for &chunk_index in chunks {
+                let absolute_start = chunk_index * chunk_size_bytes;
+                let absolute_end = ((chunk_index + 1) * chunk_size_bytes).min(archive_len);
+                let relative_start = (absolute_start - range_start) as usize;
+                let relative_end = (absolute_end - range_start) as usize;
+                self.chunk_cache.put(
+                    ChunkCacheKey::new(tileset_id, chunk_index),
+                    bytes.slice(relative_start..relative_end),
+                );
             }
 
             Ok(())
         }
+    }
+}
+
+impl From<ObjectStoreError> for ChunkFetchError {
+    fn from(error: ObjectStoreError) -> Self {
+        if matches!(error, ObjectStoreError::NotFound { .. }) {
+            return Self::NotFound;
+        }
+        Self::Message(format!(
+            "failed to fetch chunk range from object store: {error}"
+        ))
     }
 }
 
@@ -285,11 +299,6 @@ pub(crate) fn byte_range_chunk_indices(start: u64, end: u64, chunk_size_bytes: u
     let first_chunk = chunk_index(start, chunk_size_bytes);
     let last_chunk = chunk_index(end.saturating_sub(1), chunk_size_bytes);
     (first_chunk..=last_chunk).collect()
-}
-
-/// Returns the exclusive end offset of a chunk.
-pub(crate) fn chunk_end(chunk_index: u64, chunk_size_bytes: u64) -> u64 {
-    (chunk_index + 1) * chunk_size_bytes
 }
 
 /// Groups chunk indices into fetch ranges subject to gap and size limits.

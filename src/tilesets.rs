@@ -55,7 +55,6 @@ pub struct TilesetServiceConfig {
 
 /// High-level tileset service that combines routing, forwarding, and caches.
 pub struct TilesetService {
-    self_node_id: String,
     peer_backend: PeerBackend,
     pmtiles: Arc<PmtilesReader<DistributedStorage>>,
     resource_cache: ResourceCache,
@@ -86,7 +85,6 @@ impl TilesetService {
             http_client.clone(),
         );
         let chunked_store = ChunkedStore::new(
-            config.self_node_id.clone(),
             config.data_url,
             config.chunk_size_bytes,
             config.max_fetch_chunks,
@@ -98,7 +96,6 @@ impl TilesetService {
             DistributedStorage::new(chunked_store.clone(), peer_backend.clone());
         let pmtiles = Arc::new(PmtilesReader::new(pmtiles_storage)?);
         Ok(Self {
-            self_node_id: config.self_node_id,
             peer_backend,
             pmtiles,
             resource_cache: ResourceCache::new(RESOURCE_CACHE_MAX_BYTES),
@@ -127,7 +124,6 @@ impl TilesetService {
             .map_err(|error| TilesetError::InvalidInput(error.to_string()))?;
 
         debug!(
-            node_id = self.self_node_id,
             tileset_id = %tileset_id,
             tile_id = tile_id,
             "tile request"
@@ -177,7 +173,6 @@ impl TilesetService {
         validate_tileset_id(tileset_id.as_ref())
             .map_err(|error| TilesetError::InvalidInput(error.to_string()))?;
         debug!(
-            node_id = %self.self_node_id,
             tileset_id = %tileset_id,
             tile_id = tile_id,
             "internal tile request"
@@ -201,7 +196,6 @@ impl TilesetService {
             .map_err(|error| TilesetError::InvalidInput(error.to_string()))?;
         if let Some(info) = self.resource_cache.get_tileset_info(&tileset_id) {
             debug!(
-                node_id = self.self_node_id,
                 tileset_id = %tileset_id,
                 "tileset info cache hit"
             );
@@ -209,7 +203,6 @@ impl TilesetService {
         }
 
         debug!(
-            node_id = self.self_node_id,
             tileset_id = %tileset_id,
             "tileset info request"
         );
@@ -354,7 +347,6 @@ impl TilesetService {
             return Ok(CachedTileLookup::None);
         };
         tracing::debug!(
-            node_id = %self.self_node_id,
             tileset_id = %tileset_id,
             tile_id = tile_id,
             "tile cache hit"

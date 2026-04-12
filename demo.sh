@@ -4,6 +4,7 @@ set -euo pipefail
 trap 'jobs -pr | xargs -r kill 2>/dev/null || true; wait' INT TERM EXIT
 
 NUM_NODES="${NUM_NODES:-3}"
+LOG_FILE="${LOG_FILE:-log.txt}"
 BASE_HTTP_PORT=8080
 BASE_GOSSIP_PORT=7946
 
@@ -13,6 +14,7 @@ if [[ ! "$NUM_NODES" =~ ^[0-9]+$ ]] || (( NUM_NODES < 1 )); then
 fi
 
 cargo build
+: > "$LOG_FILE"
 
 seed_addrs=()
 for ((i = 0; i < NUM_NODES; i++)); do
@@ -23,7 +25,8 @@ for ((i = 0; i < NUM_NODES; i++)); do
   if (( ${#seed_addrs[@]} > 0 )); then
     args+=(--seeds "$(IFS=,; echo "${seed_addrs[*]}")")
   fi
-  "${args[@]}" &
+  echo "starting node-${i}: http_port=${http_port} gossip_addr=${listen_addr} log=${LOG_FILE}"
+  "${args[@]}" 2>&1 | sed -u "s/^/[node-${i}] /" | tee -a "$LOG_FILE" &
   seed_addrs+=("$listen_addr")
 done
 

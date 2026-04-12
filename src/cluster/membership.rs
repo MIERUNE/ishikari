@@ -225,21 +225,25 @@ impl Membership {
         let ready = self.ready.clone();
 
         tokio::spawn(async move {
+            let mut previous_peers: Option<Vec<Peer>> = None;
             loop {
                 let peers = collect_live_peers_from_nodes(&live_nodes.borrow());
                 if !ready.load(Ordering::Relaxed) && peers.iter().any(|peer| peer.id != node_id) {
                     ready.store(true, Ordering::Relaxed);
-                    info!(node_id = %node_id, "node is ready");
+                    info!("node is ready");
                 }
-                let peers_str = format!(
-                    "[{}]",
-                    peers
-                        .iter()
-                        .map(|peer| format!("\"{}\"", peer.addr))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-                info!(node_id = %node_id, peers = %peers_str, "membership changed");
+                if previous_peers.as_ref() != Some(&peers) {
+                    let peers_str = format!(
+                        "[{}]",
+                        peers
+                            .iter()
+                            .map(|peer| format!("\"{}\"", peer.addr))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    info!(peers = %peers_str, "membership changed");
+                    previous_peers = Some(peers.clone());
+                }
 
                 if live_nodes.changed().await.is_err() {
                     break;

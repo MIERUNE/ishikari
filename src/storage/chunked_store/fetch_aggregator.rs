@@ -3,11 +3,10 @@
 use std::{
     collections::{BTreeSet, HashMap},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::anyhow;
-use object_store::Error as ObjectStoreError;
 use thiserror::Error;
 use tokio::{
     sync::{Mutex, oneshot},
@@ -15,10 +14,11 @@ use tokio::{
 };
 use tracing::debug;
 
-use crate::interned_str::InternedStr;
+use crate::interned_str::TilesetId;
 
 const FETCH_MERGE_WINDOW: Duration = Duration::from_millis(10);
 const IMMEDIATE_CHUNK_INDEX: u64 = 0;
+const MAX_CONCURRENT_FETCHES_PER_TILESET: usize = 32;
 
 /// Errors produced while fetching raw backend chunks.
 #[derive(Clone, Debug, Error)]
@@ -29,55 +29,49 @@ pub enum ChunkFetchError {
     Message(String),
 }
 
-impl From<ObjectStoreError> for ChunkFetchError {
-    fn from(error: ObjectStoreError) -> Self {
-        if matches!(error, ObjectStoreError::NotFound { .. }) {
-            return Self::NotFound;
-        }
-        Self::Message(format!("failed to fetch chunk range from object store: {error}"))
-    }
-}
-
 /// Backend capabilities required by the chunk fetch aggregator.
 pub trait ChunkFetchBackend: Send + Sync + 'static {
-    /// Returns the backend node identifier for logging.
-    fn backend_node_id(&self) -> &str;
+    /// Splits requested chunks into backend fetch groups.
+    fn chunk_fetch_groups(&self, chunks: &BTreeSet<u64>) -> Vec<BTreeSet<u64>>;
 
-    /// Returns whether a chunk is already cached locally.
-    fn chunk_present(&self, tileset_id: &InternedStr, chunk_index: u64) -> bool;
-
-    /// Fetches a batch of chunks into the local chunk cache.
-    fn fetch_chunk_batch(
+    /// Fetches one chunk group into the local chunk cache.
+    fn fetch_chunk_group(
         &self,
-        tileset_id: &InternedStr,
+        tileset_id: &TilesetId,
         chunks: &BTreeSet<u64>,
         archive_len: u64,
-        batch_age_ms: u64,
     ) -> impl std::future::Future<Output = std::result::Result<(), ChunkFetchError>> + Send;
 }
 
 /// Coordinates shared inflight chunk fetches.
 #[derive(Clone, Default)]
 pub struct FetchAggregator {
-    states: Arc<Mutex<HashMap<InternedStr, TilesetFetchState>>>,
+    /// Per-tileset fetch state keyed by tileset id.
+    tileset_states: Arc<Mutex<HashMap<TilesetId, TilesetFetchState>>>,
 }
 
+/// Inflight and pending fetch coordination state for a single tileset.
 #[derive(Default)]
 struct TilesetFetchState {
+    /// Chunks queued for the next backend fetch batch.
     pending_chunks: BTreeSet<u64>,
+    /// Chunks currently being fetched from the backend.
     inflight_chunks: BTreeSet<u64>,
+    /// Per-chunk waiters that are released when the shared fetch completes.
     waiters: HashMap<u64, Vec<oneshot::Sender<Result<(), ChunkFetchError>>>>,
-    task_running: bool,
+    /// Whether the per-tileset scheduler task is currently running.
+    scheduler_running: bool,
+    /// Number of backend fetches currently inflight for this tileset.
+    inflight_batch_count: usize,
     archive_len: u64,
-    batch_started_at: Option<Instant>,
 }
 
 impl FetchAggregator {
-    /// Ensures the required chunks are present locally, batching concurrent misses.
-    pub async fn ensure_chunks<B>(
+    /// Fetches chunks for a tileset while coalescing concurrent requests.
+    pub async fn fetch_chunks<B>(
         &self,
         backend: B,
-        tileset_id: &InternedStr,
+        tileset_id: &TilesetId,
         required_chunks: &[u64],
         archive_len: u64,
     ) -> std::result::Result<(), ChunkFetchError>
@@ -87,57 +81,43 @@ impl FetchAggregator {
         let mut receivers = Vec::new();
 
         {
-            let mut states = self.states.lock().await;
-            let state = states.entry(tileset_id.clone()).or_default();
-            let created_new_batch = !state.task_running
-                && state.pending_chunks.is_empty()
-                && state.inflight_chunks.is_empty();
-            state.archive_len = state.archive_len.max(archive_len);
-            let mut newly_requested_chunks = BTreeSet::new();
+            let mut tileset_states = self.tileset_states.lock().await;
+            let tileset_state = tileset_states.entry(tileset_id.clone()).or_default();
+            let was_idle = !tileset_state.scheduler_running
+                && tileset_state.pending_chunks.is_empty()
+                && tileset_state.inflight_chunks.is_empty()
+                && tileset_state.inflight_batch_count == 0;
+            tileset_state.archive_len = tileset_state.archive_len.max(archive_len);
 
             for &chunk_index in required_chunks {
-                if backend.chunk_present(tileset_id, chunk_index) {
-                    continue;
-                }
-
                 let (tx, rx) = oneshot::channel();
-                state.waiters.entry(chunk_index).or_default().push(tx);
-                if !state.inflight_chunks.contains(&chunk_index)
-                    && state.pending_chunks.insert(chunk_index)
-                {
-                    newly_requested_chunks.insert(chunk_index);
+                // Each caller waits on its own oneshot, but the actual backend fetch is shared.
+                tileset_state
+                    .waiters
+                    .entry(chunk_index)
+                    .or_default()
+                    .push(tx);
+                if !tileset_state.inflight_chunks.contains(&chunk_index) {
+                    tileset_state.pending_chunks.insert(chunk_index);
                 }
                 receivers.push(rx);
             }
 
-            if !newly_requested_chunks.is_empty() {
-                if created_new_batch {
-                    state.batch_started_at = Some(Instant::now());
-                }
-                debug!(
-                    node_id = %backend.backend_node_id(),
-                    tileset_id = %tileset_id,
-                    requested_chunks = ?newly_requested_chunks,
-                    pending_chunks = ?state.pending_chunks,
-                    inflight_chunks = ?state.inflight_chunks,
-                    "{}",
-                    if created_new_batch {
-                        "created chunk fetch batch"
-                    } else {
-                        "batched into pending chunk fetch batch"
-                    }
-                );
-            }
-
-            if !state.task_running && !state.pending_chunks.is_empty() {
-                state.task_running = true;
-                let flush_immediately =
-                    created_new_batch && state.pending_chunks.contains(&IMMEDIATE_CHUNK_INDEX);
+            if !tileset_state.scheduler_running && !tileset_state.pending_chunks.is_empty() {
+                tileset_state.scheduler_running = true;
+                let flush_immediately = was_idle
+                    && tileset_state
+                        .pending_chunks
+                        .contains(&IMMEDIATE_CHUNK_INDEX);
                 let aggregator = self.clone();
                 let tileset_id = tileset_id.clone();
                 let backend = backend.clone();
+                // A single scheduler task wakes every merge window and starts new fetch batches
+                // while this tileset has pending work and available inflight capacity.
                 tokio::spawn(async move {
-                    aggregator.run(backend, tileset_id, flush_immediately).await;
+                    aggregator
+                        .run_scheduler(backend, tileset_id, flush_immediately)
+                        .await;
                 });
             }
         }
@@ -152,8 +132,8 @@ impl FetchAggregator {
         Ok(())
     }
 
-    /// Flushes a pending object batch into chunk fetches after the merge window.
-    async fn run<B>(&self, backend: B, tileset_id: InternedStr, mut flush_immediately: bool)
+    /// Wakes every merge window and starts at most one new fetch batch per tick.
+    async fn run_scheduler<B>(&self, backend: B, tileset_id: TilesetId, mut flush_immediately: bool)
     where
         B: ChunkFetchBackend + Clone,
     {
@@ -164,71 +144,114 @@ impl FetchAggregator {
                 time::sleep(FETCH_MERGE_WINDOW).await;
             }
 
-            let (chunks, archive_len, batch_age_ms) = {
-                let mut states = self.states.lock().await;
-                let Some(state) = states.get_mut(&tileset_id) else {
+            let groups = {
+                let mut tileset_states = self.tileset_states.lock().await;
+                let Some(state) = tileset_states.get_mut(&tileset_id) else {
                     return;
                 };
                 if state.pending_chunks.is_empty() {
-                    if state.inflight_chunks.is_empty() {
-                        state.task_running = false;
-                        states.remove(&tileset_id);
-                        debug!(node_id = %backend.backend_node_id(), tileset_id = %tileset_id, "removed empty chunk fetch state");
+                    // No work is queued for the next tick, so the scheduler can stop. The
+                    // tileset state remains alive while inflight batches are still running.
+                    state.scheduler_running = false;
+                    if state.inflight_batch_count == 0 {
+                        tileset_states.remove(&tileset_id);
+                        debug!(tileset_id = %tileset_id, "removed empty chunk fetch state");
                     }
                     return;
                 }
-                let chunks = std::mem::take(&mut state.pending_chunks);
-                state.inflight_chunks.extend(chunks.iter().copied());
-                let batch_age_ms = state
-                    .batch_started_at
-                    .map(|started_at| started_at.elapsed().as_millis() as u64)
-                    .unwrap_or_default();
-                (chunks, state.archive_len, batch_age_ms)
+                if state.inflight_batch_count >= MAX_CONCURRENT_FETCHES_PER_TILESET {
+                    None
+                } else {
+                    let available_slots =
+                        MAX_CONCURRENT_FETCHES_PER_TILESET - state.inflight_batch_count;
+                    let selected_groups: Vec<_> = backend
+                        .chunk_fetch_groups(&state.pending_chunks)
+                        .into_iter()
+                        .take(available_slots)
+                        .collect();
+                    if selected_groups.is_empty() {
+                        None
+                    } else {
+                        for chunks in &selected_groups {
+                            // Mark each scheduled group inflight while leaving unscheduled chunks
+                            // in pending for a later merge window tick.
+                            state.inflight_chunks.extend(chunks.iter().copied());
+                            for &chunk_index in chunks {
+                                state.pending_chunks.remove(&chunk_index);
+                            }
+                        }
+                        state.inflight_batch_count += selected_groups.len();
+                        Some((selected_groups, state.archive_len))
+                    }
+                }
             };
 
-            let result = backend
-                .fetch_chunk_batch(&tileset_id, &chunks, archive_len, batch_age_ms)
-                .await
-                .map_err(|error| error.clone());
-
-            let mut states = self.states.lock().await;
-            let Some(state) = states.get_mut(&tileset_id) else {
+            let Some((groups, archive_len)) = groups else {
                 continue;
             };
 
-            for &chunk_index in &chunks {
-                state.inflight_chunks.remove(&chunk_index);
-                if let Some(waiters) = state.waiters.remove(&chunk_index) {
-                    for waiter in waiters {
-                        let _ = waiter.send(result.clone());
-                    }
+            for chunks in groups {
+                let aggregator = self.clone();
+                let tileset_id = tileset_id.clone();
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    aggregator
+                        .run_fetch_batch(backend, tileset_id, chunks, archive_len)
+                        .await;
+                });
+            }
+        }
+    }
+
+    /// Fetches one batch and releases all waiters for the covered chunks.
+    async fn run_fetch_batch<B>(
+        &self,
+        backend: B,
+        tileset_id: TilesetId,
+        chunks: BTreeSet<u64>,
+        archive_len: u64,
+    ) where
+        B: ChunkFetchBackend + Clone,
+    {
+        let result = backend
+            .fetch_chunk_group(&tileset_id, &chunks, archive_len)
+            .await;
+
+        let mut tileset_states = self.tileset_states.lock().await;
+        let Some(state) = tileset_states.get_mut(&tileset_id) else {
+            return;
+        };
+
+        state.inflight_batch_count = state.inflight_batch_count.saturating_sub(1);
+        for &chunk_index in &chunks {
+            state.inflight_chunks.remove(&chunk_index);
+            if let Some(waiters) = state.waiters.remove(&chunk_index) {
+                // All callers waiting on this chunk observe the same fetch result.
+                for waiter in waiters {
+                    let _ = waiter.send(result.clone());
                 }
             }
+        }
 
-            let waiter_count: usize = state.waiters.values().map(Vec::len).sum();
-            debug!(
-                node_id = %backend.backend_node_id(),
-                tileset_id = %tileset_id,
-                completed_chunks = ?chunks,
-                fetch_succeeded = result.is_ok(),
-                pending_chunks = ?state.pending_chunks,
-                inflight_chunks = ?state.inflight_chunks,
-                waiter_keys = state.waiters.len(),
-                waiters = waiter_count,
-                "completed chunk fetch batch"
-            );
+        let waiter_count: usize = state.waiters.values().map(Vec::len).sum();
+        debug!(
+            tileset_id = %tileset_id,
+            completed_chunks = ?chunks,
+            fetch_succeeded = result.is_ok(),
+            pending_chunks = ?state.pending_chunks,
+            inflight_chunks = ?state.inflight_chunks,
+            inflight_batches = state.inflight_batch_count,
+            waiter_keys = state.waiters.len(),
+            waiters = waiter_count,
+            "completed chunk fetch batch"
+        );
 
-            if state.pending_chunks.is_empty() && state.inflight_chunks.is_empty() {
-                state.task_running = false;
-                state.batch_started_at = None;
-                states.remove(&tileset_id);
-                debug!(node_id = %backend.backend_node_id(), tileset_id = %tileset_id, "removed empty chunk fetch state");
-                return;
-            }
-
-            if state.inflight_chunks.is_empty() {
-                state.batch_started_at = Some(Instant::now());
-            }
+        if !state.scheduler_running
+            && state.pending_chunks.is_empty()
+            && state.inflight_batch_count == 0
+        {
+            tileset_states.remove(&tileset_id);
+            debug!(tileset_id = %tileset_id, "removed empty chunk fetch state");
         }
     }
 }

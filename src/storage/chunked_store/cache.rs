@@ -1,22 +1,22 @@
 //! Per-tileset chunk caches used by chunked byte-range readers.
 
 use bytes::Bytes;
-use moka::sync::Cache;
+use moka::{policy::EvictionPolicy, sync::Cache};
 
-use crate::interned_str::InternedStr;
+use crate::interned_str::TilesetId;
 
 const CHUNK_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Identifies a cached fixed-size chunk within an object.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ChunkCacheKey {
-    pub tileset_id: InternedStr,
+    pub tileset_id: TilesetId,
     pub chunk_index: u64,
 }
 
 impl ChunkCacheKey {
     /// Builds a chunk cache key from an object id and fixed-size chunk index.
-    pub fn new(tileset_id: &InternedStr, chunk_index: u64) -> Self {
+    pub fn new(tileset_id: &TilesetId, chunk_index: u64) -> Self {
         Self {
             tileset_id: tileset_id.clone(),
             chunk_index,
@@ -34,6 +34,7 @@ impl ChunkCache {
     /// Creates a chunk cache with a byte-based capacity limit.
     pub fn new(max_capacity_bytes: u64) -> Self {
         let cache = Cache::builder()
+            .eviction_policy(EvictionPolicy::lru())
             .max_capacity(max_capacity_bytes.min(CHUNK_CACHE_MAX_BYTES))
             .weigher(chunk_cache_weight)
             .build();
