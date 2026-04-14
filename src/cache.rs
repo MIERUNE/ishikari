@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use moka::sync::Cache;
 
-use crate::{interned_str::TilesetId, tilesets::TilesetInfo};
+use crate::{interned::TilesetId, storage::TilesetInfo};
 
 /// Identifies a cached tile payload within a tileset.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -53,7 +53,11 @@ pub enum Resource {
 /// Cache entry for a tile, including negative lookups.
 #[derive(Clone)]
 pub enum CachedTile {
-    Found(bytes::Bytes),
+    Found {
+        bytes: bytes::Bytes,
+        content_type: &'static str,
+        content_encoding: Option<&'static str>,
+    },
     NotFound,
 }
 
@@ -126,7 +130,7 @@ impl ResourceCache {
 /// Estimates the weight of a cached tile entry.
 fn tile_cache_weight(key: &TileCacheKey, value: &CachedTile) -> u32 {
     let value_size = match value {
-        CachedTile::Found(bytes) => bytes.len(),
+        CachedTile::Found { bytes, .. } => bytes.len(),
         CachedTile::NotFound => 0,
     };
     let total = std::mem::size_of_val(key).saturating_add(value_size);

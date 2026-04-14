@@ -12,7 +12,7 @@ use axum::{
 use tracing::debug;
 
 use crate::{
-    interned_str::TilesetId,
+    interned::TilesetId,
     pmtiles::{TileCoord, TileData, TileId},
     server::{AppState, HttpError},
 };
@@ -24,13 +24,14 @@ pub(crate) async fn tile_handler(
     State(state): State<AppState>,
     Path((tileset_id, z, x, y)): Path<(String, u8, u32, u32)>,
 ) -> Result<Response<Body>, HttpError> {
-    let tileset_id = TilesetId::from(tileset_id);
+    let tileset_id = TilesetId::try_from(tileset_id)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     let tile_id = TileId::from(
         TileCoord::new(z, x, y).map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?,
     )
     .value();
     state
-        .tileset_service
+        .resource_resolver
         .route_tile(tileset_id, tile_id)
         .await
         .map_err(tileset_error_response)?
@@ -51,9 +52,10 @@ pub(crate) async fn internal_tile_handler(
     State(state): State<AppState>,
     Path((tileset_id, tile_id)): Path<(String, u64)>,
 ) -> Result<Response<Body>, HttpError> {
-    let tileset_id = TilesetId::from(tileset_id);
+    let tileset_id = TilesetId::try_from(tileset_id)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     state
-        .tileset_service
+        .resource_resolver
         .load_tile_by_id(tileset_id, tile_id)
         .await
         .map_err(tileset_error_response)?

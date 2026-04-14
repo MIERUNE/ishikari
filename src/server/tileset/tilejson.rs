@@ -10,10 +10,10 @@ use axum::{
 use tracing::debug;
 
 use crate::{
-    interned_str::TilesetId,
+    interned::TilesetId,
     pmtiles::{Tilestats, VectorLayer},
     server::{AppState, HttpError, get_origin},
-    tilesets::TilesetInfo,
+    storage::TilesetInfo,
 };
 
 use super::error::tileset_error_response;
@@ -56,10 +56,11 @@ pub(crate) async fn tilejson_handler(
     Path(tileset_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<TileJson>, HttpError> {
-    let tileset_id = TilesetId::from(tileset_id);
+    let tileset_id = TilesetId::try_from(tileset_id)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     let base_url = get_origin(&headers);
     let data = state
-        .tileset_service
+        .resource_resolver
         .load_tileset_info(tileset_id.clone())
         .await
         .map_err(tileset_error_response)?

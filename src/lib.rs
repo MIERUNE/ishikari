@@ -1,9 +1,8 @@
-pub mod cache;
-pub mod cluster;
+mod cache;
 pub mod config;
-pub mod interned_str;
+mod interned;
+pub mod membership;
 pub mod metrics;
 pub mod pmtiles;
 pub mod server;
 pub mod storage;
-pub mod tilesets;

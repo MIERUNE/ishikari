@@ -56,7 +56,7 @@ pub struct NodeView {
 }
 
 /// Reachable peer information derived from membership gossip state.
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Peer {
     pub id: String,
     pub addr: SocketAddr,

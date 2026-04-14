@@ -14,10 +14,10 @@ use tracing::debug;
 use twox_hash::XxHash64;
 
 use crate::{
-    interned_str::TilesetId,
+    interned::TilesetId,
     pmtiles::TileType,
     server::{AppState, HttpError, get_origin},
-    tilesets::{TilesetInfo, validate_tileset_id},
+    storage::TilesetInfo,
 };
 
 use super::error::tileset_error_response;
@@ -55,13 +55,18 @@ impl DemEncoding {
 
 /// Serves the lightweight HTML preview shell for a tileset.
 pub(crate) async fn preview_handler(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(tileset_id): Path<String>,
     Query(query): Query<PreviewQuery>,
 ) -> Result<Html<String>, HttpError> {
-    let tileset_id = TilesetId::from(tileset_id);
-    validate_tileset_id(tileset_id.as_ref())
+    let tileset_id = TilesetId::try_from(tileset_id)
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    state
+        .resource_resolver
+        .load_tileset_info(tileset_id.clone())
+        .await
+        .map_err(tileset_error_response)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "tileset not found".to_string()))?;
     let html = preview_html(&tileset_id, query.encoding.as_deref());
     debug!(
         endpoint = "preview",
@@ -79,14 +84,15 @@ pub(crate) async fn preview_style_handler(
     headers: HeaderMap,
     Query(query): Query<PreviewQuery>,
 ) -> Result<Json<Value>, HttpError> {
-    let tileset_id = TilesetId::from(tileset_id);
+    let tileset_id = TilesetId::try_from(tileset_id)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     let base_url = get_origin(&headers);
     let info = state
-        .tileset_service
+        .resource_resolver
         .load_tileset_info(tileset_id.clone())
         .await
         .map_err(tileset_error_response)?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "not found".to_string()))?;
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "tileset not found".to_string()))?;
     let style = preview_style(&tileset_id, &base_url, &info, query.encoding.as_deref());
     debug!(
         endpoint = "preview_style",

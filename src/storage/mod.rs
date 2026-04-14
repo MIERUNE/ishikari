@@ -1,9 +1,9 @@
 //! Storage integrations for local chunked reads and peer forwarding.
 
-pub mod chunked_store;
-mod distributed;
+mod chunked_store;
 mod peer;
+mod pmtiles;
+mod resolver;
+mod routing;
 
-pub use chunked_store::ChunkedStore;
-pub use distributed::DistributedStorage;
-pub(crate) use peer::{PeerBackend, PeerFetchError};
+pub use resolver::{ResourceResolver, ResourceResolverConfig, TilesetError, TilesetInfo};

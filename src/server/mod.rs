@@ -2,10 +2,10 @@
 
 use std::{future::Future, net::SocketAddr, sync::Arc};
 
-use crate::{cluster::membership::Membership, metrics::NodeMetrics, server, tilesets::TilesetService};
+use crate::{membership::Membership, metrics::NodeMetrics, server, storage::ResourceResolver};
 use anyhow::{Context, Result};
 use axum::{
-    Json, Router,
+    Json, Router, ServiceExt,
     extract::State,
     http::{HeaderMap, StatusCode},
     routing::get,
@@ -18,19 +18,19 @@ pub(crate) type HttpError = (StatusCode, String);
 pub struct AppState {
     membership: Membership,
     pub(crate) metrics: NodeMetrics,
-    tileset_service: Arc<TilesetService>,
+    resource_resolver: Arc<ResourceResolver>,
 }
 
 impl AppState {
     pub fn new(
         membership: Membership,
         metrics: NodeMetrics,
-        tileset_service: Arc<TilesetService>,
+        resource_resolver: Arc<ResourceResolver>,
     ) -> Self {
         Self {
             membership,
             metrics,
-            tileset_service,
+            resource_resolver,
         }
     }
 }
@@ -66,12 +66,8 @@ pub async fn run_http_server(
             get(server::tileset::internal_tile_handler),
         )
         .route(
-            "/_internal/pmtiles/{tileset_id}/index",
-            get(server::internal::internal_archive_index_handler),
-        )
-        .route(
-            "/_internal/pmtiles/{tileset_id}/metadata",
-            get(server::internal::internal_metadata_handler),
+            "/_internal/pmtiles/{tileset_id}/bootstrap",
+            get(server::internal::internal_bootstrap_handler),
         )
         .route(
             "/_internal/pmtiles/{tileset_id}/leaf/{offset}/{length}",
@@ -80,14 +76,19 @@ pub async fn run_http_server(
         .fallback(not_found)
         .with_state(state);
 
+    // let app: NormalizePath<Router> = NormalizePath::trim_trailing_slash(app);
+
     let listener = TcpListener::bind(listen_addr)
         .await
         .with_context(|| format!("failed to bind {listen_addr}"))?;
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await
-        .context("http server failed")
+    axum::serve(
+        listener,
+        ServiceExt::<axum::http::Request<axum::body::Body>>::into_make_service(app),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
+    .context("http server failed")
 }
 
 pub(crate) fn get_origin(headers: &HeaderMap) -> String {
@@ -136,9 +137,7 @@ async fn not_found() -> (StatusCode, &'static str) {
 }
 
 /// Returns the current cluster membership snapshot.
-async fn cluster_handler(
-    State(state): State<AppState>,
-) -> Json<crate::cluster::membership::ClusterView> {
+async fn cluster_handler(State(state): State<AppState>) -> Json<crate::membership::ClusterView> {
     Json(state.membership.cluster_view().await)
 }
 

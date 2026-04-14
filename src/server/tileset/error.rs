@@ -4,12 +4,11 @@ use axum::http::StatusCode;
 use tracing::error;
 
 use crate::server::HttpError;
-use crate::tilesets::TilesetError;
+use crate::storage::TilesetError;
 
 /// Converts service-layer tileset errors into HTTP status codes and messages.
 pub(crate) fn tileset_error_response(error: TilesetError) -> HttpError {
     match error {
-        TilesetError::InvalidInput(message) => (StatusCode::BAD_REQUEST, message),
         TilesetError::Upstream(message) | TilesetError::RetryableUpstream(message) => {
             (StatusCode::BAD_GATEWAY, message)
         }

@@ -18,12 +18,6 @@ pub struct TileData {
     pub content_encoding: Option<&'static str>,
 }
 
-/// Result of a tile lookup together with whether chunk cache satisfied it.
-pub struct TileFetch {
-    pub cache_hit: bool,
-    pub tile: TileData,
-}
-
 /// XYZ tile coordinates validated against the PMTiles zoom range.
 #[derive(Clone, Copy)]
 pub struct TileCoord {

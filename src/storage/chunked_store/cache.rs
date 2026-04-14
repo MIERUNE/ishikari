@@ -1,9 +1,9 @@
-//! Per-tileset chunk caches used by chunked byte-range readers.
+//! Per-object chunk caches used by chunked byte-range readers.
 
 use bytes::Bytes;
 use moka::{policy::EvictionPolicy, sync::Cache};
 
-use crate::interned_str::TilesetId;
+use crate::interned::TilesetId;
 
 const CHUNK_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 

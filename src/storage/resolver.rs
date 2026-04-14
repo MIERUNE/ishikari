@@ -9,16 +9,17 @@ use reqwest::Client;
 use thiserror::Error;
 use tracing::{debug, warn};
 
+use super::{
+    chunked_store::ChunkedStore,
+    peer::{PeerBackend, PeerFetchError},
+    pmtiles::DistributedPmtilesStorage,
+    routing::HrwRouter,
+};
 use crate::{
-    cache::{ResourceCache, TileCache, TileCacheKey, CachedTile},
-    cluster::{
-        membership::{Membership, Peer},
-        router::HrwRouter,
-    },
-    interned_str::TilesetId,
-    metrics::NodeMetrics,
-    pmtiles::{Header, Metadata, Reader as PmtilesReader, TileData},
-    storage::{ChunkedStore, DistributedStorage, PeerBackend, PeerFetchError},
+    cache::{CachedTile, ResourceCache, TileCache, TileCacheKey},
+    interned::TilesetId,
+    membership::{Membership, Peer},
+    pmtiles::{BootstrapTransfer, Header, Metadata, Reader as PmtilesReader, TileData},
 };
 
 const RESOURCE_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
@@ -38,8 +39,8 @@ impl TilesetInfo {
     }
 }
 
-/// Runtime configuration for constructing a [`TilesetService`].
-pub struct TilesetServiceConfig {
+/// Runtime configuration for constructing a [`ResourceResolver`].
+pub struct ResourceResolverConfig {
     pub self_node_id: String,
     pub membership: Membership,
     pub data_url: String,
@@ -47,19 +48,17 @@ pub struct TilesetServiceConfig {
     pub tile_group_size: u64,
     pub chunk_size_bytes: u64,
     pub max_fetch_chunks: u64,
-    pub backend_fetch_delay_ms: u64,
+    pub debug_fetch_delay_ms: u64,
     pub tile_cache_max_bytes: u64,
     pub chunk_cache_max_bytes: u64,
-    pub metrics: NodeMetrics,
 }
 
-/// High-level tileset service that combines routing, forwarding, and caches.
-pub struct TilesetService {
+/// High-level resource resolver that combines routing, forwarding, and caches.
+pub struct ResourceResolver {
     peer_backend: PeerBackend,
-    pmtiles: Arc<PmtilesReader<DistributedStorage>>,
+    pmtiles: Arc<PmtilesReader<DistributedPmtilesStorage>>,
     resource_cache: ResourceCache,
     tile_cache: TileCache,
-    chunked_store: ChunkedStore,
 }
 
 enum CachedTileLookup {
@@ -68,9 +67,9 @@ enum CachedTileLookup {
     None,
 }
 
-impl TilesetService {
-    /// Builds the tileset service and its local caches.
-    pub async fn new(config: TilesetServiceConfig) -> Result<Self> {
+impl ResourceResolver {
+    /// Builds the resource resolver and its local caches.
+    pub async fn new(config: ResourceResolverConfig) -> Result<Self> {
         let http_client = Client::builder()
             .connect_timeout(INTERNAL_HTTP_CONNECT_TIMEOUT)
             .timeout(INTERNAL_HTTP_REQUEST_TIMEOUT)
@@ -88,19 +87,17 @@ impl TilesetService {
             config.data_url,
             config.chunk_size_bytes,
             config.max_fetch_chunks,
-            config.backend_fetch_delay_ms,
+            config.debug_fetch_delay_ms,
             config.chunk_cache_max_bytes,
-            config.metrics,
         )?;
         let pmtiles_storage =
-            DistributedStorage::new(chunked_store.clone(), peer_backend.clone());
+            DistributedPmtilesStorage::new(chunked_store, peer_backend.clone());
         let pmtiles = Arc::new(PmtilesReader::new(pmtiles_storage)?);
         Ok(Self {
             peer_backend,
             pmtiles,
             resource_cache: ResourceCache::new(RESOURCE_CACHE_MAX_BYTES),
             tile_cache: TileCache::new(config.tile_cache_max_bytes),
-            chunked_store,
         })
     }
 
@@ -111,7 +108,11 @@ impl TilesetService {
 
     /// Returns the current weighted byte size of the chunk cache.
     pub fn chunk_cache_weighted_size(&self) -> u64 {
-        self.chunked_store.chunk_cache_weighted_size()
+        self.pmtiles.storage().chunk_cache_weighted_size()
+    }
+
+    pub fn received_bytes(&self) -> u64 {
+        self.pmtiles.storage().received_bytes()
     }
 
     /// Serves an external tile request addressed by PMTiles tile id.
@@ -120,16 +121,13 @@ impl TilesetService {
         tileset_id: TilesetId,
         tile_id: u64,
     ) -> Result<Option<TileData>, TilesetError> {
-        validate_tileset_id(tileset_id.as_ref())
-            .map_err(|error| TilesetError::InvalidInput(error.to_string()))?;
-
         debug!(
             tileset_id = %tileset_id,
             tile_id = tile_id,
             "tile request"
         );
 
-        match self.load_cached_tile(&tileset_id, tile_id).await? {
+        match self.load_cached_tile(&tileset_id, tile_id) {
             CachedTileLookup::Found(tile) => return Ok(Some(tile)),
             CachedTileLookup::NotFound => return Ok(None),
             CachedTileLookup::None => {}
@@ -140,22 +138,25 @@ impl TilesetService {
         if candidates.is_empty()
             || candidates
                 .first()
-                .is_some_and(|peer| self.peer_backend.is_self(peer))
+                .is_some_and(|peer| self.peer_backend.is_self(&peer.peer))
         {
             return self.load_local_tile(&tileset_id, tile_id).await;
         }
 
         for peer in candidates {
-            if self.peer_backend.is_self(&peer) {
+            if self.peer_backend.is_self(&peer.peer) {
                 return self.load_local_tile(&tileset_id, tile_id).await;
             }
 
-            match self.load_tile_from_peer(&peer, &tileset_id, tile_id).await {
+            match self
+                .load_tile_from_peer(&peer.peer, &tileset_id, tile_id)
+                .await
+            {
                 Ok(Some(tile)) => return Ok(Some(tile)),
                 Ok(None) => return Ok(None),
                 Err(TilesetError::Miss) => {}
                 Err(error) if error.is_retryable() => {
-                    warn!(peer_id = %peer.id, error = %error, "tile forward failed; trying fallback");
+                    warn!(peer_id = %peer.peer.id, error = %error, "tile forward failed; trying fallback");
                 }
                 Err(error) => return Err(error),
             }
@@ -170,15 +171,13 @@ impl TilesetService {
         tileset_id: TilesetId,
         tile_id: u64,
     ) -> Result<Option<TileData>, TilesetError> {
-        validate_tileset_id(tileset_id.as_ref())
-            .map_err(|error| TilesetError::InvalidInput(error.to_string()))?;
         debug!(
             tileset_id = %tileset_id,
             tile_id = tile_id,
             "internal tile request"
         );
 
-        match self.load_cached_tile(&tileset_id, tile_id).await? {
+        match self.load_cached_tile(&tileset_id, tile_id) {
             CachedTileLookup::Found(tile) => return Ok(Some(tile)),
             CachedTileLookup::NotFound => return Ok(None),
             CachedTileLookup::None => {}
@@ -192,8 +191,6 @@ impl TilesetService {
         &self,
         tileset_id: TilesetId,
     ) -> Result<Option<Arc<TilesetInfo>>, TilesetError> {
-        validate_tileset_id(tileset_id.as_ref())
-            .map_err(|error| TilesetError::InvalidInput(error.to_string()))?;
         if let Some(info) = self.resource_cache.get_tileset_info(&tileset_id) {
             debug!(
                 tileset_id = %tileset_id,
@@ -216,28 +213,14 @@ impl TilesetService {
         Ok(Some(info))
     }
 
-    /// Loads local raw PMTiles archive bootstrap bytes for internal forwarding.
-    pub(crate) async fn load_archive_index_bytes(
+    /// Loads local raw bootstrap bytes for internal forwarding, optionally including metadata.
+    pub(crate) async fn load_bootstrap_bytes(
         &self,
         tileset_id: TilesetId,
-    ) -> Result<Option<Bytes>, TilesetError> {
-        validate_tileset_id(tileset_id.as_ref())
-            .map_err(|error| TilesetError::InvalidInput(error.to_string()))?;
+        include_metadata: bool,
+    ) -> Result<Option<BootstrapTransfer>, TilesetError> {
         self.pmtiles
-            .load_archive_index_bytes_local(&tileset_id)
-            .await
-            .map_err(internal_tileset_error)
-    }
-
-    /// Loads local raw PMTiles metadata bytes for internal forwarding.
-    pub(crate) async fn load_metadata_bytes(
-        &self,
-        tileset_id: TilesetId,
-    ) -> Result<Option<Bytes>, TilesetError> {
-        validate_tileset_id(tileset_id.as_ref())
-            .map_err(|error| TilesetError::InvalidInput(error.to_string()))?;
-        self.pmtiles
-            .load_metadata_bytes_local(&tileset_id)
+            .load_bootstrap_bytes_local(&tileset_id, include_metadata)
             .await
             .map_err(internal_tileset_error)
     }
@@ -249,8 +232,6 @@ impl TilesetService {
         offset: u64,
         length: usize,
     ) -> Result<Option<Bytes>, TilesetError> {
-        validate_tileset_id(tileset_id.as_ref())
-            .map_err(|error| TilesetError::InvalidInput(error.to_string()))?;
         self.pmtiles
             .load_leaf_bytes_local(&tileset_id, offset, length)
             .await
@@ -289,19 +270,19 @@ impl TilesetService {
         tileset_id: &TilesetId,
         tile_id: u64,
     ) -> Result<Option<TileData>, TilesetError> {
-        let fetch = self
+        let tile = self
             .pmtiles
             .get_tile(tileset_id, tile_id)
             .await
             .map_err(internal_tileset_error)?;
 
-        let Some(fetch) = fetch else {
+        let Some(tile) = tile else {
             self.cache_tile_miss(tileset_id, tile_id);
             return Ok(None);
         };
 
-        self.cache_tile_hit(tileset_id, tile_id, fetch.tile.bytes.clone());
-        Ok(Some(fetch.tile))
+        self.cache_tile_hit(tileset_id, tile_id, &tile);
+        Ok(Some(tile))
     }
 
     /// Forwards a tile request to the selected peer over the internal HTTP API.
@@ -329,50 +310,49 @@ impl TilesetService {
         let Some(header) = header else {
             return Ok(None);
         };
-        self.cache_tile_hit(tileset_id, tile_id, bytes.clone());
-        Ok(Some(TileData {
+        let tile = TileData {
             bytes,
             content_type: header.tile_type.content_type(),
             content_encoding: header.tile_compression.content_encoding(),
-        }))
+        };
+        self.cache_tile_hit(tileset_id, tile_id, &tile);
+        Ok(Some(tile))
     }
 
     /// Returns a tile from the local L1 tile cache when present.
-    async fn load_cached_tile(
-        &self,
-        tileset_id: &TilesetId,
-        tile_id: u64,
-    ) -> Result<CachedTileLookup, TilesetError> {
+    fn load_cached_tile(&self, tileset_id: &TilesetId, tile_id: u64) -> CachedTileLookup {
         let Some(entry) = self.tile_cache.get(&TileCacheKey::new(tileset_id, tile_id)) else {
-            return Ok(CachedTileLookup::None);
+            return CachedTileLookup::None;
         };
         tracing::debug!(
             tileset_id = %tileset_id,
             tile_id = tile_id,
             "tile cache hit"
         );
-        let CachedTile::Found(bytes) = entry else {
-            return Ok(CachedTileLookup::NotFound);
-        };
-        let header = self
-            .pmtiles
-            .header(tileset_id)
-            .await
-            .map_err(internal_tileset_error)?;
-        let Some(header) = header else {
-            return Ok(CachedTileLookup::None);
-        };
-        Ok(CachedTileLookup::Found(TileData {
-            bytes,
-            content_type: header.tile_type.content_type(),
-            content_encoding: header.tile_compression.content_encoding(),
-        }))
+        match entry {
+            CachedTile::Found {
+                bytes,
+                content_type,
+                content_encoding,
+            } => CachedTileLookup::Found(TileData {
+                bytes,
+                content_type,
+                content_encoding,
+            }),
+            CachedTile::NotFound => CachedTileLookup::NotFound,
+        }
     }
 
     /// Stores a positive tile cache entry in the local L1 tile cache.
-    fn cache_tile_hit(&self, tileset_id: &TilesetId, tile_id: u64, bytes: bytes::Bytes) {
-        self.tile_cache
-            .put(TileCacheKey::new(tileset_id, tile_id), CachedTile::Found(bytes));
+    fn cache_tile_hit(&self, tileset_id: &TilesetId, tile_id: u64, tile: &TileData) {
+        self.tile_cache.put(
+            TileCacheKey::new(tileset_id, tile_id),
+            CachedTile::Found {
+                bytes: tile.bytes.clone(),
+                content_type: tile.content_type,
+                content_encoding: tile.content_encoding,
+            },
+        );
     }
 
     /// Stores a negative tile cache entry in the local L1 tile cache.
@@ -385,8 +365,6 @@ impl TilesetService {
 /// Errors returned by the tileset service before HTTP status mapping.
 #[derive(Debug, Error)]
 pub enum TilesetError {
-    #[error("{0}")]
-    InvalidInput(String),
     #[error("{0}")]
     Upstream(String),
     #[error("{0}")]
@@ -410,9 +388,12 @@ impl TilesetError {
     }
 }
 
-
 fn format_error_chain(error: &anyhow::Error) -> String {
-    error.chain().map(ToString::to_string).collect::<Vec<_>>().join(": ")
+    error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
 }
 
 fn internal_tileset_error(error: anyhow::Error) -> TilesetError {
@@ -423,16 +404,3 @@ fn internal_tileset_error(error: anyhow::Error) -> TilesetError {
     TilesetError::Internal(message)
 }
 
-/// Validates a tileset identifier before using it in object-store paths.
-pub fn validate_tileset_id(tileset_id: &str) -> Result<()> {
-    if tileset_id.is_empty() {
-        anyhow::bail!("tileset_id must not be empty");
-    }
-    if tileset_id
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-    {
-        return Ok(());
-    }
-    anyhow::bail!("tileset_id contains invalid characters");
-}

@@ -8,7 +8,7 @@ use super::{
     format::{Directory, Header},
     metadata::Metadata,
 };
-use crate::interned_str::TilesetId;
+use crate::interned::TilesetId;
 
 const ARCHIVE_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const LEAF_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
@@ -61,18 +61,16 @@ impl ArchiveCache {
         Self {
             archives: Cache::builder()
                 .max_capacity(ARCHIVE_CACHE_MAX_BYTES)
-                .weigher(
-                    |tileset_id: &TilesetId, archive: &ArchiveBootstrap| -> u32 {
-                        (std::mem::size_of_val(tileset_id)
-                            + std::mem::size_of::<Header>()
-                            + archive.root.approx_byte_size()
-                            + archive
-                                .metadata
-                                .as_ref()
-                                .map_or(0, |metadata| metadata.approx_byte_size()))
-                        .min(u32::MAX as usize) as u32
-                    },
-                )
+                .weigher(|tileset_id: &TilesetId, archive: &ArchiveBootstrap| -> u32 {
+                    (std::mem::size_of_val(tileset_id)
+                        + std::mem::size_of::<Header>()
+                        + archive.root.approx_byte_size()
+                        + archive
+                            .metadata
+                            .as_ref()
+                            .map_or(0, |metadata| metadata.approx_byte_size()))
+                    .min(u32::MAX as usize) as u32
+                })
                 .build(),
             leafs: Cache::builder()
                 .max_capacity(LEAF_CACHE_MAX_BYTES)
@@ -90,15 +88,15 @@ impl ArchiveCache {
     }
 
     /// Inserts or replaces the cached header/root index for a tileset.
-    pub fn put(&self, tileset_id: TilesetId, archive: ArchiveBootstrap) {
-        self.archives.insert(tileset_id, archive);
+    pub fn put(&self, tileset_id: &TilesetId, archive: ArchiveBootstrap) {
+        self.archives.insert(tileset_id.clone(), archive);
     }
 
     /// Replaces the cached metadata for a tileset while preserving header and root.
-    pub fn put_metadata(&self, tileset_id: TilesetId, metadata: Arc<Metadata>) {
-        if let Some(mut archive) = self.archives.get(&tileset_id) {
+    pub fn put_metadata(&self, tileset_id: &TilesetId, metadata: Arc<Metadata>) {
+        if let Some(mut archive) = self.archives.get(tileset_id) {
             archive.metadata = Some(metadata);
-            self.archives.insert(tileset_id, archive);
+            self.archives.insert(tileset_id.clone(), archive);
         }
     }
 

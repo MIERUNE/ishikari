@@ -7,7 +7,7 @@ use std::{
 
 use clap::Parser;
 
-use crate::cluster::membership;
+use crate::membership;
 
 /// Resolved application configuration used at startup.
 pub struct Config {
@@ -20,7 +20,7 @@ pub struct Config {
     pub router_tile_group_size: u64,
     pub chunk_size_bytes: u64,
     pub max_fetch_chunks: u64,
-    pub backend_fetch_delay_ms: u64,
+    pub debug_fetch_delay_ms: u64,
     pub tile_cache_max_bytes: u64,
     pub chunk_cache_max_bytes: u64,
 }
@@ -49,7 +49,7 @@ pub struct Cli {
     #[arg(long, env = "MAX_FETCH_CHUNKS", default_value_t = 4)]
     max_fetch_chunks: u64,
     #[arg(long, env = "BACKEND_FETCH_DELAY_MS", default_value_t = 0)]
-    backend_fetch_delay_ms: u64,
+    debug_fetch_delay_ms: u64,
     #[arg(long, env = "TILE_CACHE_MAX_BYTES", default_value_t = 64 * 1024 * 1024)]
     tile_cache_max_bytes: u64,
     #[arg(long, env = "CHUNK_CACHE_MAX_BYTES", default_value_t = 512 * 1024 * 1024)]
@@ -89,7 +89,7 @@ impl Config {
             router_tile_group_size: cli.router_tile_group_size,
             chunk_size_bytes: cli.chunk_size_bytes,
             max_fetch_chunks: cli.max_fetch_chunks.max(1),
-            backend_fetch_delay_ms: cli.backend_fetch_delay_ms,
+            debug_fetch_delay_ms: cli.debug_fetch_delay_ms,
             tile_cache_max_bytes: cli.tile_cache_max_bytes,
             chunk_cache_max_bytes: cli.chunk_cache_max_bytes,
         }

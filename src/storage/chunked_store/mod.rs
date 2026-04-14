@@ -1,7 +1,9 @@
-//! Chunked byte-range planning, caching, and inflight fetch aggregation.
+//! Chunked byte-range planning, caching, and inflight fetch coordination.
 
 mod cache;
-pub(crate) mod fetch_aggregator;
-pub(crate) mod object_store;
+mod coordinator;
+mod fetcher;
+mod store;
 
-pub use object_store::ChunkedStore;
+pub use fetcher::ChunkFetchError;
+pub use store::ChunkedStore;

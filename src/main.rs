@@ -5,11 +5,11 @@ use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use ishikari::{
-    cluster::membership::Membership,
     config::Config,
+    membership::Membership,
     metrics::NodeMetrics,
     server::{AppState, run_http_server},
-    tilesets::{TilesetService, TilesetServiceConfig},
+    storage::{ResourceResolver, ResourceResolverConfig},
 };
 
 const DRAINING_PROPAGATION_DELAY: Duration = Duration::from_secs(2);
@@ -39,7 +39,7 @@ async fn main() -> Result<()> {
         data_url = %config.data_url,
         chunk_size_bytes = config.chunk_size_bytes,
         max_fetch_chunks = config.max_fetch_chunks,
-        backend_fetch_delay_ms = config.backend_fetch_delay_ms,
+        debug_fetch_delay_ms = config.debug_fetch_delay_ms,
         tile_cache_max_bytes = config.tile_cache_max_bytes,
         "starting node"
     );
@@ -47,8 +47,8 @@ async fn main() -> Result<()> {
     let membership = Membership::spawn(config.membership).await?;
     let metrics = NodeMetrics::new();
 
-    let tileset_service = Arc::new(
-        TilesetService::new(TilesetServiceConfig {
+    let resource_resolver = Arc::new(
+        ResourceResolver::new(ResourceResolverConfig {
             self_node_id: config.node_id.clone(),
             membership: membership.clone(),
             data_url: config.data_url,
@@ -56,18 +56,17 @@ async fn main() -> Result<()> {
             tile_group_size: config.router_tile_group_size,
             chunk_size_bytes: config.chunk_size_bytes,
             max_fetch_chunks: config.max_fetch_chunks,
-            backend_fetch_delay_ms: config.backend_fetch_delay_ms,
+            debug_fetch_delay_ms: config.debug_fetch_delay_ms,
             tile_cache_max_bytes: config.tile_cache_max_bytes,
             chunk_cache_max_bytes: config.chunk_cache_max_bytes,
-            metrics: metrics.clone(),
         })
         .await?,
     );
 
-    spawn_stats_reporter(membership.clone(), tileset_service.clone(), metrics.clone());
+    spawn_stats_reporter(membership.clone(), resource_resolver.clone(), metrics.clone());
 
     run_http_server(
-        AppState::new(membership.clone(), metrics, tileset_service),
+        AppState::new(membership.clone(), metrics, resource_resolver),
         config.http_listen_addr,
         shutdown_signal(membership.clone()),
     )
@@ -100,7 +99,7 @@ async fn wait_for_shutdown_signal() {
 
 fn spawn_stats_reporter(
     membership: Membership,
-    tileset_service: Arc<TilesetService>,
+    resource_resolver: Arc<ResourceResolver>,
     metrics: NodeMetrics,
 ) {
     tokio::spawn(async move {
@@ -111,11 +110,11 @@ fn spawn_stats_reporter(
                 .set_many(&[
                     (
                         "cache-tile-bytes",
-                        tileset_service.tile_cache_weighted_size().to_string(),
+                        resource_resolver.tile_cache_weighted_size().to_string(),
                     ),
                     (
                         "cache-chunk-bytes",
-                        tileset_service.chunk_cache_weighted_size().to_string(),
+                        resource_resolver.chunk_cache_weighted_size().to_string(),
                     ),
                     (
                         "transfer-external-bytes",
@@ -127,7 +126,7 @@ fn spawn_stats_reporter(
                     ),
                     (
                         "transfer-backend-bytes",
-                        metrics.backend_bytes().to_string(),
+                        resource_resolver.received_bytes().to_string(),
                     ),
                 ])
                 .await;
