@@ -1,6 +1,0 @@
-.git
-target
-data
-*.pmtiles
-census_2020_1km_population.geojson
-log*

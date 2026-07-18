@@ -1,7 +1,0 @@
-.DS_Store
-/target
-/k8s
-log*
-/data/
-ishikari-sim/data/
-ishikari-sim/data/census_2020_1km_population.geojson
