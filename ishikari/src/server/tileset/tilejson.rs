@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use axum::{
     extract::{Path, Query, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderMap, StatusCode},
     response::Response,
 };
 use serde::Deserialize;
@@ -13,10 +13,7 @@ use tracing::debug;
 use crate::{
     interned::TilesetId,
     pmtiles::{TileType, Tilestats, VectorLayer},
-    server::{
-        AppState, HttpError, apply_origin_vary, bytes_response, cache, conditional::Validators,
-        get_origin,
-    },
+    server::{AppState, HttpError, cache, conditional::Validators, get_origin},
     storage::TilesetInfo,
 };
 
@@ -125,21 +122,7 @@ async fn serve_tilejson(
     })?;
     let validators = Validators::for_derived_body(&body);
     debug!(endpoint = "tilejson", tileset_id = %tileset_id, "served external response");
-    if validators.not_modified(&headers) {
-        let mut response = Response::new(axum::body::Body::empty());
-        *response.status_mut() = StatusCode::NOT_MODIFIED;
-        response.headers_mut().insert(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static(cache::TILEJSON),
-        );
-        validators.apply(response.headers_mut());
-        apply_origin_vary(response.headers_mut());
-        return Ok(response);
-    }
-    let mut response = bytes_response(body, "application/json", Some(cache::TILEJSON));
-    validators.apply(response.headers_mut());
-    apply_origin_vary(response.headers_mut());
-    Ok(response)
+    Ok(validators.origin_varying_json_response(&headers, body, cache::TILEJSON))
 }
 
 /// Converts PMTiles header and metadata into a TileJSON document.

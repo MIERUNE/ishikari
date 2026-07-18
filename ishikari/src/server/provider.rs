@@ -163,6 +163,17 @@ pub(crate) fn path_percent_encode(value: &str) -> String {
     out
 }
 
+/// Stable HRW routing key for a provider upstream. The URL is digested rather
+/// than embedded: routing keys are logged verbatim (`routing_key`) on forward
+/// warnings, and a provider URL can carry a signed query string or API key
+/// that must never reach logs. Routing only needs key stability.
+pub(crate) fn provider_routing_key(kind: &str, upstream_url: &str) -> String {
+    use std::hash::Hasher;
+    let mut hasher = twox_hash::XxHash64::with_seed(0x726f7574); // "rout"
+    hasher.write(upstream_url.as_bytes());
+    format!("{kind}:{:016x}", hasher.finish())
+}
+
 pub(crate) fn path_percent_encode_segments(value: &str) -> String {
     value
         .split('/')
@@ -249,6 +260,21 @@ mod tests {
         assert_eq!(
             config.resolve_sprite_url("hokkaido", "@2x.png").as_deref(),
             Some("s3://bucket/sprite/sprite@2x.png")
+        );
+    }
+
+    #[test]
+    fn routing_keys_never_embed_the_upstream_url() {
+        let url = "https://cdn.example/style.json?X-Signature=SECRETTOKEN";
+        let key = super::provider_routing_key("style", url);
+        assert!(key.starts_with("style:"), "{key}");
+        assert!(!key.contains("SECRETTOKEN"), "{key}");
+        assert!(!key.contains("cdn.example"), "{key}");
+        // Stable for routing, distinct per URL.
+        assert_eq!(key, super::provider_routing_key("style", url));
+        assert_ne!(
+            key,
+            super::provider_routing_key("style", "https://cdn.example/other.json")
         );
     }
 }

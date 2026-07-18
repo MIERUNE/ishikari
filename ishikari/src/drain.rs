@@ -40,6 +40,7 @@ impl DrainController {
 /// `/_internal/cluster`) stay available throughout.
 pub fn is_drainable_path(path: &str) -> bool {
     path.starts_with("/_internal/tiles/")
+        || path.starts_with("/_internal/derived/")
         || path.starts_with("/_internal/pmtiles/")
         || path.starts_with("/_internal/provider/")
 }
@@ -52,6 +53,9 @@ mod tests {
     fn only_peer_forwarding_paths_drain() {
         // Peer-to-peer forwarding into this node: rejected on drain for fast failover.
         assert!(is_drainable_path("/_internal/tiles/demo/streets/0/0/0"));
+        assert!(is_drainable_path(
+            "/_internal/derived/mapterhorn/planet/hillshade/8/226/100"
+        ));
         assert!(is_drainable_path(
             "/_internal/pmtiles/demo/streets/bootstrap"
         ));

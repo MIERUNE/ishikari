@@ -26,8 +26,7 @@ pub fn generate() -> String {
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos() as u64)
-        .unwrap_or(0);
+        .map_or(0, |elapsed| elapsed.as_nanos() as u64);
     format!("ish-{nanos:x}-{seq:x}")
 }
 
@@ -67,7 +66,7 @@ fn is_valid(value: &str) -> bool {
 
 /// Returns the request id in scope for the current task, if any.
 pub fn current() -> Option<String> {
-    REQUEST_ID.try_with(|id| id.clone()).ok()
+    REQUEST_ID.try_with(Clone::clone).ok()
 }
 
 #[cfg(test)]

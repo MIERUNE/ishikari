@@ -261,6 +261,16 @@ async fn spawn_upstream() -> (
             }),
         )
         .route(
+            // A 2xx status that carries no complete representation must never
+            // be cached or served as a style.
+            "/styles/nocontent/style.json",
+            get(|| async { StatusCode::NO_CONTENT }),
+        )
+        .route(
+            "/styles/partial/style.json",
+            get(|| async { (StatusCode::PARTIAL_CONTENT, "partial") }),
+        )
+        .route(
             "/styles/base/sprite.json",
             get(|| async { ([(header::CONTENT_TYPE, "application/json")], "{}") }),
         )
@@ -309,6 +319,7 @@ struct Harness {
     invalid_upstream_requests: Arc<AtomicUsize>,
     aged_upstream_requests: Arc<AtomicUsize>,
     revalidated_upstream_requests: Arc<AtomicUsize>,
+    state: AppState,
 }
 
 impl Harness {
@@ -420,8 +431,11 @@ async fn harness(label: &str) -> Harness {
         provider,
         registry,
         TileRuntimeConfig {
+            // >= 3 so the class shares partition exactly (terrain 1, provider 1,
+            // transcode 1) and the CPU-work isolation tests exercise the real
+            // production regime rather than the sub-three shared-ceiling floor.
             mapterhorn: None,
-            cpu_work_concurrency: 1,
+            cpu_work_concurrency: 3,
             cpu_work_max_inflight: 4,
             derived_negative_ttl: Duration::from_secs(60),
         },
@@ -429,7 +443,8 @@ async fn harness(label: &str) -> Harness {
 
     Harness {
         public: with_common_layers(public_router(), state.clone()),
-        internal: with_common_layers(internal_router(), state),
+        internal: with_common_layers(internal_router(), state.clone()),
+        state,
         membership,
         tiles_dir,
         uncached_upstream_requests,
@@ -437,6 +452,82 @@ async fn harness(label: &str) -> Harness {
         aged_upstream_requests,
         revalidated_upstream_requests,
     }
+}
+
+#[tokio::test]
+async fn tiles_and_transcodes_run_while_terrain_saturates_its_cpu_share() {
+    let harness = harness("tile-isolation").await;
+
+    // Saturate the terrain CPU class as a stuck generation flood would. Terrain
+    // gets its own execution share; stored tiles need no CPU permit, and MLT
+    // transcode has a reserved share terrain cannot take — so both proceed
+    // *without* the terrain permit ever being released.
+    let _heavy = saturate_terrain_cpu(&harness.state).await;
+
+    let (status, _, _) = harness
+        .get(&harness.public, "/tilesets/fixture/0/0/0")
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "stored tiles must not touch CPU pools"
+    );
+
+    let (status, headers, _) = tokio::time::timeout(
+        Duration::from_secs(2),
+        harness.get(&harness.public, "/tilesets/fixture/0/0/0.mlt"),
+    )
+    .await
+    .expect("transcode must not wait on the terrain class");
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers[header::CONTENT_TYPE],
+        "application/vnd.maplibre-tile"
+    );
+
+    harness.cleanup();
+}
+
+#[tokio::test]
+async fn styles_run_while_terrain_saturates_its_cpu_share() {
+    let harness = harness("style-isolation").await;
+
+    // A terrain flood holds every terrain execution permit. Provider work has
+    // its own reserved share, so style rewriting runs concurrently — not after
+    // the terrain permit releases.
+    let _heavy = saturate_terrain_cpu(&harness.state).await;
+
+    let (status, headers, _) = tokio::time::timeout(
+        Duration::from_secs(2),
+        harness.get(&harness.public, "/styles/base/style.json"),
+    )
+    .await
+    .expect("style must not wait on the terrain class");
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers.contains_key(header::ETAG));
+
+    harness.cleanup();
+}
+
+/// Holds every terrain-class CPU permit, standing in for a terrain generation
+/// flood. Kept alive by the returned guard for the duration of the assertions.
+async fn saturate_terrain_cpu(state: &AppState) -> Vec<super::AdmittedCpuWorkPermit> {
+    let mut held = Vec::new();
+    // Acquire well past any realistic share; each `acquire` returns immediately
+    // while permits remain and the loop stops once the class is fully occupied.
+    for _ in 0..64 {
+        match tokio::time::timeout(
+            Duration::from_millis(50),
+            state.acquire_admitted_cpu_work("test_saturation"),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => held.push(permit),
+            _ => break,
+        }
+    }
+    assert!(!held.is_empty(), "expected at least one terrain permit");
+    held
 }
 
 #[tokio::test]
@@ -551,6 +642,16 @@ async fn stale_provider_revalidation_reuses_bytes_on_origin_304() {
 }
 
 #[tokio::test]
+async fn non_200_success_statuses_are_rejected_as_upstream_errors() {
+    let harness = harness("non-200-style").await;
+    for path in ["/styles/nocontent/style.json", "/styles/partial/style.json"] {
+        let (status, _, _) = harness.get(&harness.public, path).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "path: {path}");
+    }
+    harness.cleanup();
+}
+
+#[tokio::test]
 async fn invalid_style_json_never_enters_the_provider_cache() {
     let harness = harness("invalid-style").await;
     let path = "/styles/invalid/style.json";
@@ -566,6 +667,23 @@ async fn invalid_style_json_never_enters_the_provider_cache() {
         harness.invalid_upstream_requests.load(Ordering::Relaxed),
         2,
         "invalid successful origin responses must not be cached"
+    );
+
+    let (status, _, metrics) = harness.get(&harness.internal, "/_internal/metrics").await;
+    assert_eq!(status, StatusCode::OK);
+    let metrics = String::from_utf8_lossy(&metrics);
+    let validation = metrics
+        .lines()
+        .find(|line| {
+            line.starts_with("ishikari_cpu_work_admission_total{")
+                && line.contains("work=\"provider_json_validation\"")
+                && line.contains("outcome=\"accepted\"")
+        })
+        .expect("provider JSON validation admission metric");
+    assert!(validation.ends_with(" 2"), "{validation}");
+    assert!(
+        !metrics.contains("work=\"style_rewrite\""),
+        "invalid JSON must fail before style rewriting: {metrics}"
     );
     harness.cleanup();
 }

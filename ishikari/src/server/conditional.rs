@@ -12,7 +12,11 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use axum::http::{HeaderMap, HeaderValue, header};
+use axum::{
+    body::Body,
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    response::Response,
+};
 
 /// Cache validators attached to one provider response body.
 #[derive(Clone, Default)]
@@ -111,6 +115,30 @@ impl Validators {
             return truncate_to_seconds(last_modified) <= since;
         }
         false
+    }
+
+    /// Builds an origin-dependent JSON response with identical validators,
+    /// cache policy, and Vary metadata on its `200` and `304` forms.
+    pub(crate) fn origin_varying_json_response(
+        &self,
+        request: &HeaderMap,
+        body: impl Into<Body>,
+        cache_control: &'static str,
+    ) -> Response {
+        let mut response = if self.not_modified(request) {
+            let mut response = Response::new(Body::empty());
+            *response.status_mut() = StatusCode::NOT_MODIFIED;
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static(cache_control),
+            );
+            response
+        } else {
+            super::bytes_response(body, "application/json", Some(cache_control))
+        };
+        self.apply(response.headers_mut());
+        super::apply_origin_vary(response.headers_mut());
+        response
     }
 }
 

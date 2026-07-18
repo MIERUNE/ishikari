@@ -58,8 +58,9 @@ cluster ("one config per load-test run").
   every planned range starts immediately.
 - **Q5 — Derived-tile generation queueing** (Phase 2 only). How does
   contour/hillshade generation (~100–500 ms/tile) behave under the
-  shared `ISKR_CPU_WORK_CONCURRENCY` and `ISKR_CPU_WORK_MAX_INFLIGHT` admission
-  limits with viewport request patterns? This is not modeled yet.
+  pod-wide `ISKR_CPU_WORK_CONCURRENCY` execution ceiling and class-local
+  `ISKR_CPU_WORK_MAX_INFLIGHT` admission limit with viewport request patterns?
+  This is not modeled yet.
 
 ## 2. Approach — two phases
 
@@ -87,7 +88,11 @@ uses its metadata-only range planner instead.
 
 **Phase 2: Tokio paused-time simulation** (biei-sim style) for questions where
 latency and queueing matter. VUs run concurrently as closed users: one viewport
-batch completes, then the VU sleeps for `1.2 +/- 0.5 s`. The runner uses the
+batch completes, then the VU sleeps for `1.2 +/- 0.5 s`. Imported sparse steps
+expand into at most 1,000,000 transitions per user and 10,000,000 globally,
+using checked arithmetic. Per-step deterministic think durations are summed into
+one sleep before the next emitted batch, preserving its arrival timestamp
+without scheduler-only wakeups. The runner uses the
 real resolver, caches, peer transport, single-flight, merge window, and backend
 fetch concurrency limit. Fixed backend and peer delays are controlled sweep
 inputs; fitted lognormal backend profiles are implemented. Terrain generation
@@ -168,6 +173,11 @@ emits the new level's viewport.
   matters because a peer-
   forwarded tile is inserted into the entry node's L1 *as well as* living on
   the owner — replication that reduces effective cluster-wide cache capacity.
+- Imported JSONL is bounded before allocation to 4 KiB of payload per line and
+  256 MiB of raw input including blank lines and terminators. It is also limited
+  to 2,000,000 requests, 10,000 users, and 64 requests per viewport batch.
+  Structural validation accepts sparse monotonically increasing steps; only
+  Phase 2 expands and bounds step transitions as described above.
 
 ## 4. System model (Phase 1)
 
@@ -229,7 +239,8 @@ cross-request merging. Phase 1B uses Tokio's paused clock to exercise the real
 configured merge window without sleeping in wall-clock time. Production reads
 it from `ISKR_CHUNK_FETCH_MERGE_WINDOW_MS`; simulator real-cache runs use
 `ClusterConfig::chunk_fetch_merge_window_ms`. Zero removes the intentional wait
-without disabling pending/inflight sharing or immediate bootstrap dispatch.
+without disabling pending/inflight sharing or immediate bootstrap dispatch. The
+shared production validator rejects values above 1000 ms in both modes.
 
 ### 4.3 Per-request flow
 
@@ -272,31 +283,46 @@ Per run, per node, harvested from each node's Prometheus registry
   pending chunks at dispatch, and waiters released per fetch group. Structured
   histogram snapshots are merged without parsing Prometheus text.
 
-A single run outputs one versioned (`schema_version`) self-contained JSON
-document containing execution mode, tagged trace source (`generated` with
+Normal simulation reports use report schema v2 and output one self-contained
+JSON document containing execution mode, tagged trace source (`generated` with
 workload config, or `replay` with input path), cluster config, aggregate metrics,
-and per-node summaries. Generated request traces are written separately as
+and per-node summaries. `l1_cache_hits` counts positive entry-node L1 hits;
+`negative_cache_hits` counts existing negative-entry hits separately. Generated
+request traces are written separately as
 JSONL and can be replayed in-process with either serial or viewport-batch
 execution.
 
 Churn replay emits configurable counter snapshots (default every 1,000
-requests), plus paired pre/post-event snapshots. Samples include active cache
-occupancy, per-node request counters, virtual elapsed time, and each node's
-agreement with the active membership set, so hit-rate, backend-fetch,
-load-skew, gossip-convergence, and recovery curves can be derived.
+requests), plus paired pre/post-event snapshots. Samples include explicit
+`l1_cache_hits` and `negative_cache_hits`; legacy `cache_hits` is retained as
+their cumulative sum. They also include active cache occupancy, per-node request
+counters, virtual elapsed time, and each node's agreement with the active
+membership set, so hit-rate, backend-fetch, load-skew, gossip-convergence, and
+recovery curves can be derived.
 
-The version-1 `sweep` runner accepts a versioned JSON specification, one replay
+The sweep runner accepts sweep-spec schema v1, one replay
 trace, entry-assignment seeds, a base cluster configuration, and Cartesian axes
 for node count, candidate count, tile-group size, chunk size/range cap, tile and
 chunk cache capacity, and entry-node peer caching. It builds one shared modeled
-PMTiles catalog, executes each cell in a fresh modeled cluster, and flushes one
-self-contained run document per JSONL line. Every line records the run index and
-count, effective configuration, periodic samples, simulator version, and FNV-1a
-spec/trace fingerprints. Paths are resolved relative to the spec. Duplicate
-axis values, invalid cluster dimensions, unsupported schema versions, and grids
-larger than `max_runs` are rejected before output is created.
+PMTiles catalog, executes each cell in a fresh modeled cluster, and writes one
+report-schema-v2 run document per JSONL line to a sibling temporary file. The
+destination is atomically replaced only after all cells succeed. Every line records
+`sweep_spec_schema_version: 1`, the run index and count, effective configuration,
+periodic samples, simulator version, and FNV-1a spec/trace fingerprints. Paths
+are resolved relative to the spec. Duplicate axis values, invalid cluster
+dimensions, unsupported schema versions, and grids larger than `max_runs` are
+rejected before temporary output is created. `max_runs` may lower, but cannot
+raise, the hard 10,000-run ceiling; the JSON sweep spec itself is limited to
+1 MiB before parsing.
 
-Version 1 is intentionally replay-only, sequential, and modeled-cache-only.
+Every simulator file output rejects canonical, symlink, and hard-link identity
+with its protected inputs. Generated traces, normal reports, HTTP replay
+reports, sweep results, and visualizations are published by a same-directory
+temporary-file rename, so validation or serialization failure cannot truncate
+an input or a previously complete artifact.
+
+Sweep-spec v1 is intentionally replay-only and modeled-cache-only. Sweep cells
+run sequentially, but a cell can use serial or viewport-batch request execution.
 Timed controls (`chunk_fetch_merge_window_ms`, backend latency/concurrency),
 workload-generation axes, real-cache lifecycle, and sweep-level visualization
 are not claimed by this runner. Modeled reports retain timed configuration for
@@ -331,7 +357,7 @@ Each scenario = a config grid × the workload of §3, run on the same seed(s).
   Outputs: end-user latency, backend GETs per 1k tiles, read amplification,
   chunk-cache hit rate, backend queue p95, and waiter fan-in. Generate separate
   otherwise-identical traces for `zoom_walk_probability ∈ {0,0.05,0.1,0.2}` to
-  see how cross-zoom requests break Hilbert locality; sweep version 1 is
+  see how cross-zoom requests break Hilbert locality; sweep-spec v1 is
   replay-only and intentionally does not vary workload-generation parameters.
 - **S4 — Skew under population workload (Q1).** No failures: quantify how
   uneven HRW + tile groups + a Tokyo-heavy CDF make per-node load, and confirm
@@ -371,22 +397,31 @@ an existing trace and supports two explicit target contracts:
 
 Serial mode preserves request order. `--viewport-batches` starts one validated
 `(step,user)` batch concurrently and waits for it before the next. Requests send
-`Cache-Control: no-cache`, follow no redirects, retry nothing, and fully consume
-response bodies. The versioned report contains status/body totals, bounded
-failure samples, client-observed latency percentiles, target configuration, and
-a trace fingerprint.
+`Cache-Control: no-cache`, follow no redirects, retry nothing, and stream and
+discard up to 64 MiB of each response body. An oversized body is aborted and
+reported as a failure rather than fully consumed. The report-schema-v2 document
+contains status/body totals, bounded failure samples, client-observed latency
+percentiles, target configuration, the body limits, and a trace fingerprint.
 
 Optional ordered `--metrics-url` endpoints are scraped immediately before and
 after replay. Counter deltas are derived per node before aggregation and fail on
 a reset or disappearing series. The comparable output covers normalized tile
 sources, external/internal/backend bytes, positive L1 hits, peer attempts,
-backend fetch outcomes/chunks, and chunk-cache/coordinator counters. Production
-collapses all negative result sources into `miss`, so comparison must normalize
-simulator `negative_cache`, `self_miss`, `peer_miss`, and `miss`. The production
-positive L1 metric cannot distinguish every negative-cache case, and
-client-observed Gateway latency is not equivalent to Axum's server histogram.
-Metrics are process-wide, so calibration requires an otherwise idle deployment
-and stable pod identities/restart counts outside the report.
+backend fetch outcomes/chunks, and chunk-cache/coordinator counters. Every
+execution mode reports the same L1 semantics: `l1_cache_hits` counts positive
+tile-body hits only, and `negative_cache_hits` counts actual hits on an existing
+negative entry. HTTP replay derives the latter from the always-exposed
+`ishikari_tile_negative_cache_hits_total` counter; a target without that exact
+report-v2 metric fails capture instead of silently producing zero. The legacy
+`ishikari_tile_cache_total{outcome="negative"}` remains a hit-plus-insert event
+counter and is not used for comparison. Production collapses all negative
+result sources into `miss` in `tiles_served`, so source comparison must still
+normalize simulator `negative_cache`, `self_miss`, `peer_miss`, and `miss`.
+Client-observed Gateway latency is not equivalent to Axum's server histogram.
+Metrics responses are retained up to 8 MiB and scraped sequentially, bounding
+active capture memory to one body. Metrics are process-wide, so calibration
+requires an otherwise idle deployment and stable pod identities/restart counts
+outside the report.
 
 Calibration procedure:
 
@@ -432,8 +467,7 @@ load.
 Structured production scheduler histograms and aggregate node request-load
 skew are included in current JSON reports.
 
-Remaining implementation work is tracked once in
-`../issues/ishikari-todo.md`.
+Remaining implementation work is tracked once in [TODO.md](TODO.md).
 
 ## 10. Phase 2 latency and queueing
 

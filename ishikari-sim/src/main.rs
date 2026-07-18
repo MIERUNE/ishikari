@@ -1,24 +1,20 @@
-use std::{
-    fs::File,
-    io::{BufReader, BufWriter, Write},
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{fs::File, io::BufReader, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use ishikari_sim::{
-    BackendLatencyConfig, BackendLatencyProfile, ChurnConfig, ChurnPlan, ChurnReport,
-    ClusterConfig, EntryAffinity, HttpExecutionMode, HttpReplayConfig, HttpReplayTarget,
-    ModeledCluster, PopulationCdf, SimCluster, TileCatalog, TimedConfig, TimedReport, TraceEntry,
-    Workload, WorkloadConfig, read_trace, run_churn_trace, run_http_replay,
-    run_modeled_churn_trace, run_sweep, run_timed_trace, viewport_batch_ranges, write_trace_entry,
-    write_visualization,
+    AtomicOutputFile, BackendLatencyConfig, BackendLatencyProfile, ChurnConfig, ChurnPlan,
+    ChurnReport, ClusterConfig, EntryAffinity, HttpExecutionMode, HttpReplayConfig,
+    HttpReplayTarget, ModeledCluster, PopulationCdf, SimCluster, TileCatalog, TimedConfig,
+    TimedReport, TraceEntry, Workload, WorkloadConfig, ensure_output_distinct,
+    local_source_archives_for_tilesets, read_trace, run_churn_trace, run_http_replay,
+    run_modeled_churn_trace, run_sweep, run_timed_trace, viewport_batch_ranges, write_atomic,
+    write_trace_entry, write_visualization,
 };
 use reqwest::Url;
 use serde::Serialize;
 
-const REPORT_SCHEMA_VERSION: u32 = 1;
+const REPORT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Serialize)]
 struct RunReport {
@@ -126,9 +122,8 @@ impl ReplayHttpArgs {
             (Some(_), false) => bail!("--gateway-url conflicts with --node-url"),
             (None, true) => bail!("provide --gateway-url or at least one --node-url"),
         };
-        if self.output == self.trace {
-            bail!("HTTP replay output must not overwrite the input trace");
-        }
+        ensure_output_distinct(&self.output, [self.trace.as_path()])
+            .context("validate HTTP replay output path")?;
         Ok((
             HttpReplayConfig {
                 trace_path: self.trace,
@@ -279,7 +274,53 @@ impl SimulationArgs {
         if self.churn_plan.is_some() && self.churn_sample_every_requests == 0 {
             bail!("--churn-sample-every-requests must be greater than zero");
         }
+        // A generated workload has one known tileset, so protect its exact
+        // production-resolved local archive before publishing the trace.
+        // Replay traces are handled after their entries have been parsed.
+        let source_archives = if self.simulate && self.input_trace.is_none() {
+            local_source_archives_for_tilesets(&self.tileset_sources, [self.tileset.as_str()])?
+        } else {
+            Vec::new()
+        };
+        if let Some(output) = &self.output {
+            let mut protected = vec![self.census.as_path()];
+            protected.extend(source_archives.iter().map(PathBuf::as_path));
+            ensure_output_distinct(output, protected)
+                .context("validate generated trace output path")?;
+        }
+        if let Some(report) = &self.report {
+            let mut protected = Vec::new();
+            if let Some(input_trace) = &self.input_trace {
+                protected.push(input_trace.as_path());
+            } else {
+                protected.push(self.census.as_path());
+            }
+            if let Some(output) = &self.output {
+                protected.push(output.as_path());
+            }
+            if let Some(churn_plan) = &self.churn_plan {
+                protected.push(churn_plan.as_path());
+            }
+            if let Some(profile) = &self.backend_latency_profile {
+                protected.push(profile.as_path());
+            }
+            protected.extend(source_archives.iter().map(PathBuf::as_path));
+            ensure_output_distinct(report, protected)
+                .context("validate simulation report output path")?;
+        }
         Ok(())
+    }
+
+    fn validate_replay_archive_output(&self, entries: &[TraceEntry]) -> Result<()> {
+        let Some(report) = &self.report else {
+            return Ok(());
+        };
+        let archives = local_source_archives_for_tilesets(
+            &self.tileset_sources,
+            entries.iter().map(|entry| entry.tileset.as_str()),
+        )?;
+        ensure_output_distinct(report, archives.iter().map(PathBuf::as_path))
+            .context("validate report against replay PMTiles inputs")
     }
 
     fn uses_paused_time(&self) -> bool {
@@ -404,12 +445,11 @@ async fn main() -> Result<()> {
                 let (config, output) = args.into_config()?;
                 let report = run_http_replay(config).await?;
                 let successful = report.is_success();
-                let file = File::create(&output)
-                    .with_context(|| format!("create HTTP replay report {}", output.display()))?;
-                let mut writer = BufWriter::new(file);
-                serde_json::to_writer_pretty(&mut writer, &report)
-                    .context("serialize HTTP replay report")?;
-                writer.flush().context("flush HTTP replay report")?;
+                write_atomic(&output, |writer| {
+                    serde_json::to_writer_pretty(writer, &report)
+                        .context("serialize HTTP replay report")
+                })
+                .with_context(|| format!("write HTTP replay report {}", output.display()))?;
                 eprintln!("wrote HTTP replay report to {}", output.display());
                 if !successful {
                     bail!("HTTP replay completed with failures; inspect the report");
@@ -437,6 +477,7 @@ async fn main() -> Result<()> {
         let file =
             File::open(input).with_context(|| format!("open trace file {}", input.display()))?;
         let entries = read_trace(BufReader::new(file))?;
+        args.validate_replay_archive_output(&entries)?;
         match args.cache_mode {
             CacheModeArg::Real => {
                 let cluster = cluster.as_mut().expect("real simulation cluster");
@@ -511,12 +552,10 @@ async fn main() -> Result<()> {
             result,
         };
         if let Some(path) = args.report {
-            let file = File::create(&path)
-                .with_context(|| format!("create report file {}", path.display()))?;
-            let mut report_writer = BufWriter::new(file);
-            serde_json::to_writer_pretty(&mut report_writer, &report)
-                .context("serialize simulation report")?;
-            report_writer.flush().context("flush simulation report")?;
+            write_atomic(&path, |writer| {
+                serde_json::to_writer_pretty(writer, &report).context("serialize simulation report")
+            })
+            .with_context(|| format!("write report file {}", path.display()))?;
         } else {
             eprintln!("{}", serde_json::to_string_pretty(&report)?);
         }
@@ -576,9 +615,8 @@ async fn generate_trace(
         .output
         .as_ref()
         .context("--output is required when generating a trace")?;
-    let output = File::create(output_path)
+    let mut output = AtomicOutputFile::create(output_path)
         .with_context(|| format!("create trace file {}", output_path.display()))?;
-    let mut writer = BufWriter::new(output);
     let mut workload = Workload::new(workload_config.clone(), population.clone())?;
     let mut request_count = 0_u64;
 
@@ -589,12 +627,12 @@ async fn generate_trace(
                 serve_entries(cluster, &entries, args.viewport_batches).await?;
             }
             for entry in &entries {
-                write_trace_entry(&mut writer, entry)?;
+                write_trace_entry(output.writer(), entry)?;
                 request_count += 1;
             }
         }
     }
-    writer.flush().context("flush trace")?;
+    output.finish().context("publish trace")?;
     eprintln!(
         "wrote {request_count} requests from {} population points (weight {:.0}) to {}",
         population.point_count(),
@@ -657,4 +695,32 @@ fn replay_modeled_trace(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normal_run_report_serializes_schema_v2() {
+        let report = RunReport {
+            schema_version: REPORT_SCHEMA_VERSION,
+            execution_mode: "serial",
+            cache_mode: "modeled",
+            catalog_tiles: Some(0),
+            timing: None,
+            backend_latency_profile: None,
+            churn_plan: None,
+            churn: None,
+            trace: TraceSource::Replay {
+                input: PathBuf::from("trace.jsonl"),
+                requests: 0,
+            },
+            cluster: ClusterConfig::default(),
+            result: ishikari_sim::SimReport::default(),
+        };
+
+        let value = serde_json::to_value(report).expect("serialize normal report");
+        assert_eq!(value["schema_version"], 2);
+    }
 }

@@ -1,4 +1,5 @@
 mod cache;
+pub use cache::{MIN_TILE_CACHE_ENTRY_WEIGHT, tile_cache_logical_weight};
 pub mod config;
 pub mod drain;
 mod interned;

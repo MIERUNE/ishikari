@@ -100,6 +100,7 @@ impl PmtilesStorage for DistributedPmtilesStorage {
                 .map_err(|error| match error {
                     ChunkFetchError::NotFound => StorageError::NotFound,
                     ChunkFetchError::Timeout(message) => StorageError::Timeout(message),
+                    ChunkFetchError::Overload(message) => StorageError::Overload(message),
                     ChunkFetchError::Message(message) => StorageError::Message(message),
                 })?;
 

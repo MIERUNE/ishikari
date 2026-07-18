@@ -26,6 +26,12 @@ pub(super) struct CachePolicy {
     /// clamped independently of the local entry's current age; `Age` carries
     /// the time already spent in Ishikari's cache.
     pub(super) response_cache_control: Arc<str>,
+    /// Whether the upstream declared an explicit freshness lifetime
+    /// (`max-age`/`s-maxage`). When false, `fresh` is Ishikari's invented
+    /// default, so a transported `Age`/`Date` must not be charged against it.
+    /// This travels with the policy so a background revalidation reuses the
+    /// original decision instead of re-parsing a normalized header.
+    pub(super) explicit_freshness: bool,
 }
 
 impl CachePolicy {
@@ -36,6 +42,7 @@ impl CachePolicy {
             fresh: positive_ttl(resource),
             swr: Duration::ZERO,
             response_cache_control: Arc::from(default_response_cache_control(resource)),
+            explicit_freshness: false,
         }
     }
 }
@@ -57,7 +64,7 @@ struct CacheControl {
 
 fn parse_cache_control(value: &str) -> CacheControl {
     let mut control = CacheControl::default();
-    for token in value.split(',') {
+    for token in split_directives(value) {
         let token = token.trim();
         let (name, arg) = match token.split_once('=') {
             Some((name, arg)) => (name.trim(), Some(arg.trim().trim_matches('"'))),
@@ -67,8 +74,7 @@ fn parse_cache_control(value: &str) -> CacheControl {
         // avoids turning a malformed explicit limit into the resource default.
         let seconds = || {
             arg.and_then(|arg| arg.parse::<u128>().ok())
-                .map(|seconds| seconds.min(u64::MAX as u128) as u64)
-                .unwrap_or(0)
+                .map_or(0, |seconds| seconds.min(u64::MAX as u128) as u64)
         };
         match name.to_ascii_lowercase().as_str() {
             "no-store" => control.no_store = true,
@@ -94,6 +100,36 @@ fn update_min(current: &mut Option<u64>, candidate: u64) {
     *current = Some(current.map_or(candidate, |value| value.min(candidate)));
 }
 
+/// Splits a `Cache-Control` field on directive boundaries without treating a
+/// comma inside a quoted-string argument as a separator (RFC 9110 §5.6.4
+/// quoted-string, including `\"` quoted-pairs). Without this, a valid
+/// extension such as `x-meta="foo, s-maxage=604800"` would be misread as a
+/// real `s-maxage` directive and extend the shared-cache lifetime beyond what
+/// the origin declared.
+fn split_directives(value: &str) -> Vec<&str> {
+    let mut directives = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, byte) in value.bytes().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match byte {
+            b'\\' if quoted => escaped = true,
+            b'"' => quoted = !quoted,
+            b',' if !quoted => {
+                directives.push(&value[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    directives.push(&value[start..]);
+    directives
+}
+
 /// Resolves the effective policy. A shared cache prefers `s-maxage` over
 /// `max-age`; `no-store`, `no-cache`, and `private` bypass this shared cache.
 /// Revalidation-required responses never use SWR. All windows and the emitted
@@ -103,12 +139,14 @@ pub(super) fn cache_policy(resource: &'static str, upstream: Option<&str>) -> Ca
         return CachePolicy::defaulted(resource);
     };
     let response_cache_control = Arc::from(normalized_cache_control(resource, &control));
+    let explicit_freshness = control.max_age.is_some() || control.s_maxage.is_some();
     if control.no_store || control.no_cache || control.private {
         return CachePolicy {
             store: false,
             fresh: Duration::ZERO,
             swr: Duration::ZERO,
             response_cache_control,
+            explicit_freshness,
         };
     }
     let clamp = |secs: u64| Duration::from_secs(secs).min(MAX_PROVIDER_TTL);
@@ -119,24 +157,15 @@ pub(super) fn cache_policy(resource: &'static str, upstream: Option<&str>) -> Ca
     let swr = if control.must_revalidate || control.proxy_revalidate {
         Duration::ZERO
     } else {
-        control
-            .stale_while_revalidate
-            .map(clamp)
-            .unwrap_or(Duration::ZERO)
+        control.stale_while_revalidate.map_or(Duration::ZERO, clamp)
     };
     CachePolicy {
         store: true,
         fresh,
         swr,
         response_cache_control,
+        explicit_freshness,
     }
-}
-
-/// Whether upstream age metadata applies to the declared cache lifetime.
-pub(super) fn has_explicit_freshness(upstream: Option<&str>) -> bool {
-    upstream
-        .map(parse_cache_control)
-        .is_some_and(|control| control.max_age.is_some() || control.s_maxage.is_some())
 }
 
 fn normalized_cache_control(resource: &'static str, control: &CacheControl) -> String {
@@ -149,7 +178,7 @@ fn normalized_cache_control(resource: &'static str, control: &CacheControl) -> S
 
     let clamp = |seconds: u64| seconds.min(MAX_PROVIDER_TTL.as_secs());
     if control.private {
-        let max_age = control.max_age.map(clamp).unwrap_or(0);
+        let max_age = control.max_age.map_or(0, clamp);
         return format!("private, max-age={max_age}");
     }
 
@@ -320,6 +349,35 @@ mod tests {
         let control = parse_cache_control("  Public , Max-Age=\"30\" , unknown-directive ");
         assert_eq!(control.max_age, Some(30));
         assert!(!control.no_store);
+    }
+
+    #[test]
+    fn quoted_directive_arguments_do_not_leak_directives() {
+        // A comma inside a quoted extension argument is not a separator; the
+        // quoted `s-maxage` fragment must not extend the cache lifetime.
+        let control = parse_cache_control("x-meta=\"foo, s-maxage=604800\", max-age=60");
+        assert_eq!(control.s_maxage, None);
+        assert_eq!(control.max_age, Some(60));
+        assert_eq!(
+            cache_policy("style", Some("x-meta=\"foo, s-maxage=604800\"")).fresh,
+            positive_ttl("style"),
+            "quoted fragment must fall back to the resource default"
+        );
+
+        // Escaped quotes inside the quoted string do not end it early.
+        let control = parse_cache_control("x-meta=\"a\\\", max-age=604800\", max-age=45");
+        assert_eq!(control.max_age, Some(45));
+
+        // Freshness inside quotes never counts as explicit freshness.
+        assert!(!cache_policy("style", Some("x-meta=\"max-age=100\"")).explicit_freshness);
+        assert!(cache_policy("style", Some("max-age=100")).explicit_freshness);
+        assert!(!cache_policy("style", Some("stale-while-revalidate=600")).explicit_freshness);
+        assert!(!cache_policy("style", None).explicit_freshness);
+
+        // Unbalanced quotes stay conservative: everything after the opening
+        // quote is one opaque token, never a directive.
+        let control = parse_cache_control("x-meta=\"oops, s-maxage=604800");
+        assert_eq!(control.s_maxage, None);
     }
 
     #[test]

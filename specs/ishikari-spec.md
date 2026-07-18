@@ -3,7 +3,8 @@
 Durable design contract for Ishikari: what it is, what it must not become, and
 the invariants and module boundaries the implementation must uphold. Active work
 items and open decisions live in `../issues/ishikari-todo.md`. Component-level
-contracts are in `isoline-and-hillshade-spec.md` and `simulator-spec.md`.
+contracts are in [isoline-and-hillshade-spec.md](isoline-and-hillshade-spec.md)
+and [the simulator specification](../ishikari-sim/SPEC.md).
 
 ## Positioning
 
@@ -91,12 +92,62 @@ existing contract merely because it wins one benchmark.
   merged into bounded range reads and consumers of pending or in-flight chunks
   share that work. The merge window is configurable per process through
   `ISKR_CHUNK_FETCH_MERGE_WINDOW_MS`, defaults to 10 ms, and accepts 0 as a
-  no-intentional-wait baseline; bootstrap and capacity-release dispatches remain
-  immediate. Correctness must not depend on a particular merge window, chunk
-  size, or range cap; those are measured operating parameters.
+  no-intentional-wait baseline. Values above 1000 ms are rejected at startup so
+  batching cannot consume the 30-second request deadline; bootstrap and
+  capacity-release dispatches remain immediate. Correctness must not depend on
+  a particular merge window, chunk size, or range cap; those are measured
+  operating parameters.
 - Memory, distinct admitted work, backend concurrency, peer requests, and
   CPU-heavy transformations remain bounded. Overload sheds work rather than
   creating an unbounded queue.
+- Internal peer response bodies are size-bounded per resource class (a tighter
+  ceiling for provider bodies than for tiles and PMTiles sections), enforced by
+  Content-Length rejection and streamed counting. A buggy, compromised, or
+  version-incompatible peer must not be able to exhaust a node's memory; the
+  request timeout bounds duration, not bytes. A 20-second server-wide HTTP
+  deadline also bounds the complete peer-retry and local-fallback path so
+  graceful shutdown fits the deployed Spot-pod termination budget.
+- A derived tile generated with an edge fallback after a transient neighbor DEM
+  failure or an absent in-world neighbor is refreshable: it is retained locally
+  and publicly only for the short negative TTL, with no long stale-serving
+  window, so the seam can heal. Structural neighbors beyond the world's Y range
+  remain clean because they cannot later appear. Center absence produces the
+  short-lived negative derived result; a transient center failure is not cached.
+  Peer wire metadata preserves refreshability, and refreshable MLT output does
+  not enter the non-expiring transcode cache.
+- Derived-terrain pipelines are admitted *before* the neighborhood fetch: a
+  pipeline can retain a decoded 3x3 DEM neighborhood while it fetches and then
+  queues for CPU execution, so the count of concurrent pipelines — not just
+  running CPU work — is bounded (excess parents shed with 503). Child DEM decode
+  and generation stages of an admitted pipeline wait only for shared CPU
+  concurrency and do not consume additional top-level in-flight slots, avoiding
+  sibling self-shedding at a one-job limit. Supported DEM sources are square and
+  at most 512px per edge; malformed dimensions are rejected during decode before
+  caching, and a checked aggregate budget bounds a complete decoded neighborhood
+  to approximately 9 MiB. CPU-bound request work runs on the blocking pool
+  (never inline on runtime workers), partitioned into three classes whose
+  per-class execution shares sum to `cpu_work_concurrency`: the heavy terrain
+  class (DEM decode, product generation), the MLT tile-transcode class (part of
+  the core tile product), and the millisecond-scale provider class (style
+  decode/parse/rewrite/serialize, provider JSON validation). The light classes
+  hold reserved shares the terrain class cannot take, so total concurrent CPU
+  work stays within the pod budget *and* a terrain flood can neither shed nor
+  stall style or transcode — they run concurrently with saturated terrain, not
+  behind it. A pod-wide execution ceiling equal to `cpu_work_concurrency`
+  additionally caps the total: for the usual three-or-more permits it is
+  redundant with the shares, but on a tiny pod (fewer than three permits, where
+  reserving one per class would oversubscribe) it is the binding limit and the
+  classes share it — the cgroup budget is never exceeded even though full
+  isolation needs at least three permits. Each class also has its own admission
+  backlog, so one class's flood cannot shed another. Stored-tile serving uses
+  no request CPU admission at all. The trade is that the terrain class cannot
+  burst to the full pod budget even when the light classes are idle; terrain
+  throughput is deliberately capped below `cpu_work_concurrency` to protect
+  tile and style latency.
+- Derived-product TileJSON advertises what the tile handler actually serves:
+  raster products emit the image format with plain tile URLs and no vector
+  metadata; vector products emit `pbf` with the negotiated `mvt`/`mlt` encoding
+  and suffixed tile URLs.
 
 ### Work coalescing principle
 
@@ -117,7 +168,10 @@ than treating either coalescing or non-coalescing as a resource-wide rule.
   lifetime rather than restarting it at Ishikari. When Ishikari applies a default
   policy (no upstream freshness), the clock starts at fetch time, so a transported
   `Age` must not shorten or evict the defaulted entry. Repeated `Cache-Control`
-  field lines are combined before directive parsing.
+  field lines are combined before directive parsing, and directive splitting is
+  quoted-string-aware (RFC 9110 §5.6.4, including `\"` quoted-pairs): a comma or
+  freshness fragment inside a quoted extension argument is never read as a real
+  directive and cannot extend the cache lifetime.
 - `no-store`, `no-cache`, and `private` responses do not enter Ishikari's shared
   provider cache. A successful uncacheable refresh invalidates any older stale
   entry for the same resource. Concurrent followers may reuse that successful
@@ -131,7 +185,10 @@ than treating either coalescing or non-coalescing as a resource-wide rule.
   `Last-Modified` when no ETag exists) as a conditional request. An origin `304`
   rebuilds the cache entry around the existing validated bytes, retaining
   representation metadata absent from the `304`, applying updated cache policy
-  and validators, and restarting freshness without downloading the body.
+  and validators, and restarting freshness without downloading the body. When
+  the `304` omits `Cache-Control`, policy is re-derived from the original origin
+  field (including its absence), never from Ishikari's longer normalized
+  downstream header.
   Object-store origins use the equivalent `GetOptions` preconditions. The
   `revalidated` provider-cache metric distinguishes this path from a full-body
   replacement; refresh errors leave the stale entry untouched.
@@ -146,8 +203,20 @@ than treating either coalescing or non-coalescing as a resource-wide rule.
   directly; chasing a redirect would let a compromised or open-redirecting
   upstream steer the fetch at cluster-internal or link-local addresses that the
   internal-listener isolation otherwise fences off.
+- Only a plain `200 OK` carries a cacheable complete representation (besides the
+  `304`/`404` paths above). Other success statuses — `204 No Content`,
+  `206 Partial Content` — are upstream protocol errors; a partial body must
+  never be cached or served publicly as complete.
+- Provider upstream URLs may carry signed query strings or API keys. They never
+  appear in HRW routing keys (which are digests and are logged verbatim), in
+  public error bodies (transport errors are stripped of their URL before
+  formatting), or in log fields.
 - `Content-Encoding` is representation metadata and survives byte-identical
-  glyph/sprite responses and peer hops. Compressed style JSON is decoded with a
+  glyph/sprite responses and peer hops. This intentionally skips proactive
+  negotiation: a pre-compressed upstream asset is served with its stored
+  encoding even to a client that sent no `Accept-Encoding`, on the assumption
+  that gzip support is universal among map clients. Store assets identity- or
+  gzip-encoded only. Compressed style JSON is decoded with a
   bounded output before validation and rewriting; invalid JSON never enters the
   provider cache.
 - Validators pass through only for byte-identical bodies: glyphs and sprites

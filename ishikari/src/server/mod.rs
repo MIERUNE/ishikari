@@ -37,11 +37,25 @@ pub(crate) type HttpError = (StatusCode, String);
 pub struct TileRuntimeConfig {
     pub mapterhorn: Option<Arc<MapterhornResolver>>,
     pub cpu_work_concurrency: usize,
-    /// Maximum admitted CPU-work units (holding a permit or queued for one)
-    /// before new work is shed with 503.
+    /// Maximum admitted CPU-work units per work class (holding a permit or
+    /// queued for one) before new work in that class is shed with 503.
     pub cpu_work_max_inflight: usize,
     pub derived_negative_ttl: Duration,
 }
+
+/// Weight charged for a negative cache entry (derived `Absent`/`Degraded`
+/// placeholder keys, absent DEM markers). A nominal `1` would let millions of
+/// negative entries blow far past a cache's byte capacity: each entry still
+/// pays its key, enum, and moka bookkeeping on the heap.
+const NEGATIVE_CACHE_ENTRY_WEIGHT: u32 = 128;
+/// Terrain pipelines, MLT transcodes, and provider document transformations
+/// each have an independent admission counter and ceiling.
+const CPU_WORK_CLASS_COUNT: usize = 3;
+/// GKE Autopilot caps Spot-pod termination grace at 25 seconds. Shutdown spends
+/// two seconds announcing drain state before Axum stops accepting requests, so
+/// every HTTP request must finish (or be cancelled) with headroom before the
+/// platform sends SIGKILL.
+const HTTP_REQUEST_DEADLINE: Duration = Duration::from_secs(20);
 
 /// RAII reservation in the CPU-work admission counter. Reserving fails (a shed)
 /// when the counter is already at its ceiling; the reservation is released on
@@ -81,10 +95,45 @@ impl Drop for CpuWorkSlot {
     }
 }
 
-/// Admission ticket for one unit of CPU-bound request work. Holds both a
-/// concurrency permit and an in-flight slot; dropping it (e.g. at the end of the
-/// `spawn_blocking` closure) releases both.
+/// Admission ticket for one unit of CPU-bound request work. Holds a per-class
+/// execution permit and an in-flight slot; dropping it (e.g. at the end of the
+/// `spawn_blocking` closure) releases them. Class shares isolate workloads while
+/// the global permit enforces the configured pod-wide CPU ceiling.
 pub(crate) struct CpuWorkPermit {
+    _class_permit: tokio::sync::OwnedSemaphorePermit,
+    _global_permit: tokio::sync::OwnedSemaphorePermit,
+    _slot: CpuWorkSlot,
+}
+
+/// CPU execution ticket for a child stage of work whose parent request has
+/// already passed admission. It waits for its class's execution permit and the
+/// pod ceiling without reserving another in-flight slot, so sibling DEM decodes
+/// cannot shed one another.
+pub(crate) struct AdmittedCpuWorkPermit {
+    _class_permit: tokio::sync::OwnedSemaphorePermit,
+    _global_permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl AdmittedCpuWorkPermit {
+    async fn acquire(
+        class_semaphore: Arc<tokio::sync::Semaphore>,
+        global_semaphore: Arc<tokio::sync::Semaphore>,
+    ) -> Result<Self, tokio::sync::AcquireError> {
+        // Class before global everywhere, so the acquisition order is uniform
+        // and cannot deadlock.
+        let class_permit = class_semaphore.acquire_owned().await?;
+        let global_permit = global_semaphore.acquire_owned().await?;
+        Ok(Self {
+            _class_permit: class_permit,
+            _global_permit: global_permit,
+        })
+    }
+}
+
+/// Admission ticket for one derived-terrain pipeline, held from before the
+/// neighborhood fetch through the end of generation so retained decoded-DEM
+/// memory stays bounded (see [`AppState::admit_terrain_pipeline`]).
+pub(crate) struct TerrainPipelinePermit {
     _permit: tokio::sync::OwnedSemaphorePermit,
     _slot: CpuWorkSlot,
 }
@@ -103,13 +152,55 @@ impl
         value: &server::tileset::terrain::DerivedOutcome,
         _created_at: std::time::Instant,
     ) -> Option<Duration> {
-        matches!(value, server::tileset::terrain::DerivedOutcome::Absent)
-            .then_some(self.negative_ttl)
+        // Absences and refreshable edge-fallback tiles both re-resolve after
+        // the short negative TTL; only clean positive tiles live until eviction.
+        matches!(
+            value,
+            server::tileset::terrain::DerivedOutcome::Absent
+                | server::tileset::terrain::DerivedOutcome::Degraded(_)
+        )
+        .then_some(self.negative_ttl)
     }
 }
 
 struct DecodedDemExpiry {
     negative_ttl: Duration,
+}
+
+fn cache_entry_weight<K, V>(key: &K, value: &V, heap_bytes: usize) -> u32 {
+    std::mem::size_of_val(key)
+        .saturating_add(std::mem::size_of_val(value))
+        .saturating_add(heap_bytes)
+        .max(NEGATIVE_CACHE_ENTRY_WEIGHT as usize)
+        .min(u32::MAX as usize) as u32
+}
+
+fn mlt_cache_weight(key: &(crate::interned::TilesetId, u64), value: &bytes::Bytes) -> u32 {
+    // The payload can be tiny (an empty MVT gzip is only a few dozen bytes),
+    // but every entry still retains its key, Bytes handle, interned identifier,
+    // and Moka bookkeeping. Charge the visible allocations and keep the same
+    // conservative floor as the other byte-bounded tile caches.
+    cache_entry_weight(key, value, key.0.as_str().len().saturating_add(value.len()))
+}
+
+fn derived_tile_cache_weight(
+    key: &server::tileset::terrain::DerivedTileKey,
+    value: &server::tileset::terrain::DerivedOutcome,
+) -> u32 {
+    let payload_bytes = match value {
+        server::tileset::terrain::DerivedOutcome::Tile(tile)
+        | server::tileset::terrain::DerivedOutcome::Degraded(tile) => tile.bytes.len(),
+        server::tileset::terrain::DerivedOutcome::Absent => 0,
+    };
+    cache_entry_weight(key, value, payload_bytes)
+}
+
+fn decoded_dem_cache_weight(
+    key: &(crate::interned::TilesetId, u64),
+    value: &Option<Arc<server::tileset::terrain::dem::DemTile>>,
+) -> u32 {
+    let payload_bytes = value.as_ref().map_or(0, |tile| tile.byte_size());
+    cache_entry_weight(key, value, payload_bytes)
 }
 
 impl
@@ -156,13 +247,38 @@ pub struct AppState {
     /// Coalesces Moka maintenance when multiple metrics collectors scrape at
     /// once. Followers may report the previous eventually-consistent size.
     cache_maintenance_running: Arc<AtomicBool>,
-    /// Shared bound for all CPU-heavy blocking work initiated by request paths.
+    /// CPU-heavy request work is partitioned into per-class execution gates
+    /// whose permit counts partition the configured pod concurrency, plus a
+    /// pod-wide execution ceiling every class must also pass.
+    ///
+    /// For the usual `N >= 3` the class shares sum to `N`, so the class permits
+    /// alone bound total CPU to `N` and the light classes' reserved shares mean
+    /// a terrain flood can neither exceed the budget nor stall style/transcode.
+    /// For a tiny pod (`N < 3`) the shares floor at one each and would sum above
+    /// `N`; the pod ceiling then binds and enforces the true `N` (classes share
+    /// it — full isolation is impossible below three permits, but the cgroup
+    /// limit still holds). Each class also has its own admission backlog, so one
+    /// class's flood cannot shed another.
     cpu_work_semaphore: Arc<tokio::sync::Semaphore>,
+    terrain_work_semaphore: Arc<tokio::sync::Semaphore>,
+    terrain_work_concurrency: usize,
+    /// Bounds concurrent derived-terrain pipelines (fetch → CPU queue →
+    /// generation), each of which can retain a decoded 3x3 DEM neighborhood.
+    terrain_pipeline_semaphore: Arc<tokio::sync::Semaphore>,
+    terrain_pipeline_inflight: Arc<AtomicUsize>,
+    /// Class-local pool for millisecond-scale provider CPU work (style
+    /// rewriting, provider JSON validation).
+    provider_work_semaphore: Arc<tokio::sync::Semaphore>,
+    provider_work_concurrency: usize,
+    provider_work_inflight: Arc<AtomicUsize>,
+    /// Class-local pool for MLT tile transcoding.
+    transcode_work_semaphore: Arc<tokio::sync::Semaphore>,
+    transcode_work_concurrency: usize,
+    transcode_work_inflight: Arc<AtomicUsize>,
+    /// Configured pod CPU ceiling (the size of `cpu_work_semaphore`).
     cpu_work_concurrency: usize,
-    /// Count of admitted CPU-work units (holding a permit or queued for one).
-    /// Work beyond `cpu_work_max_inflight` is shed with 503 so an extreme flood
-    /// fails fast instead of growing the wait queue and blocking backlog.
-    cpu_work_inflight: Arc<AtomicUsize>,
+    /// Per-class admitted-work ceiling. Each class has its own counter so one
+    /// flood cannot consume another class's backlog budget.
     cpu_work_max_inflight: usize,
     derived_negative_ttl: Duration,
     /// Mapterhorn composite resolver, when a composite tileset is configured.
@@ -185,6 +301,18 @@ impl AppState {
             cpu_work_max_inflight,
             derived_negative_ttl,
         } = tile_runtime;
+        // Partition the pod CPU budget across classes. The light, latency-
+        // critical classes (provider, transcode) each reserve one permit;
+        // terrain takes the rest. For `N >= 3` the shares sum to `N`, so the
+        // class permits alone cap total CPU and reserve the light classes'
+        // slots. For `N < 3` the shares floor at one each (sum > N); the pod
+        // ceiling below then binds and enforces the true `N`.
+        let total_cpu = cpu_work_concurrency.max(1);
+        let provider_work_concurrency = 1;
+        let transcode_work_concurrency = 1;
+        let terrain_work_concurrency = total_cpu
+            .saturating_sub(provider_work_concurrency + transcode_work_concurrency)
+            .max(1);
         Self {
             membership,
             metrics,
@@ -198,23 +326,11 @@ impl AppState {
             // hit this cache. 64 MiB ≈ a few hundred warm MLT tiles per pod.
             mlt_cache: moka::future::Cache::builder()
                 .max_capacity(64 * 1024 * 1024)
-                .weigher(|_key, value: &bytes::Bytes| {
-                    u32::try_from(value.len()).unwrap_or(u32::MAX)
-                })
+                .weigher(mlt_cache_weight)
                 .build(),
             derived_tile_cache: moka::future::Cache::builder()
                 .max_capacity(128 * 1024 * 1024)
-                .weigher(
-                    |_key: &server::tileset::terrain::DerivedTileKey,
-                     value: &server::tileset::terrain::DerivedOutcome| {
-                        match value {
-                            server::tileset::terrain::DerivedOutcome::Tile(tile) => {
-                                u32::try_from(tile.bytes.len()).unwrap_or(u32::MAX)
-                            }
-                            server::tileset::terrain::DerivedOutcome::Absent => 1,
-                        }
-                    },
-                )
+                .weigher(derived_tile_cache_weight)
                 .expire_after(DerivedTileExpiry {
                     negative_ttl: derived_negative_ttl,
                 })
@@ -223,24 +339,38 @@ impl AppState {
             // working set, plenty for a viewport of derived tiles.
             dem_tile_cache: moka::future::Cache::builder()
                 .max_capacity(64 * 1024 * 1024)
-                .weigher(
-                    |_key: &(crate::interned::TilesetId, u64),
-                     value: &Option<Arc<server::tileset::terrain::dem::DemTile>>| {
-                        value.as_ref().map_or(1, |tile| {
-                            u32::try_from(tile.byte_size()).unwrap_or(u32::MAX)
-                        })
-                    },
-                )
+                .weigher(decoded_dem_cache_weight)
                 .expire_after(DecodedDemExpiry {
                     negative_ttl: derived_negative_ttl,
                 })
                 .build(),
             cache_maintenance_running: Arc::new(AtomicBool::new(false)),
-            cpu_work_semaphore: Arc::new(tokio::sync::Semaphore::new(
-                cpu_work_concurrency.max(1),
+            // Pod-wide execution ceiling = the configured `N`. Redundant when
+            // the class shares sum to `N` (N >= 3); the binding cap when they
+            // floor above `N` on a tiny pod.
+            cpu_work_semaphore: Arc::new(tokio::sync::Semaphore::new(total_cpu)),
+            terrain_work_semaphore: Arc::new(tokio::sync::Semaphore::new(terrain_work_concurrency)),
+            terrain_work_concurrency,
+            // Twice the terrain CPU share keeps generation fed (one pipeline
+            // generating, one pre-fetching per CPU slot) while bounding retained
+            // decoded-DEM memory to permits × one 3x3 neighborhood.
+            terrain_pipeline_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                terrain_work_concurrency.saturating_mul(2),
             )),
-            cpu_work_concurrency: cpu_work_concurrency.max(1),
-            cpu_work_inflight: Arc::new(AtomicUsize::new(0)),
+            terrain_pipeline_inflight: Arc::new(AtomicUsize::new(0)),
+            provider_work_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                provider_work_concurrency,
+            )),
+            provider_work_concurrency,
+            provider_work_inflight: Arc::new(AtomicUsize::new(0)),
+            transcode_work_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                transcode_work_concurrency,
+            )),
+            transcode_work_concurrency,
+            transcode_work_inflight: Arc::new(AtomicUsize::new(0)),
+            // The true pod ceiling is `total_cpu`, not the (possibly floored)
+            // sum of class shares.
+            cpu_work_concurrency: total_cpu,
             cpu_work_max_inflight: cpu_work_max_inflight.max(cpu_work_concurrency.max(1)),
             derived_negative_ttl,
         }
@@ -279,26 +409,58 @@ impl AppState {
         &self.dem_tile_cache
     }
 
-    /// Admits one unit of CPU-bound work: reserves an in-flight slot (shedding
-    /// with `503` when the backlog is already at its ceiling) and then waits for
-    /// a concurrency permit. Bounds both the semaphore wait queue and the
-    /// blocking-pool backlog, so an extreme flood fails fast instead of growing
-    /// memory without limit. Hold the returned permit for the whole blocking job
-    /// (move it into the `spawn_blocking` closure).
-    pub(crate) async fn admit_cpu_work(
+    /// Admits one millisecond-scale provider CPU job (style rewriting or
+    /// provider JSON validation). Its backlog and shed ceiling are isolated by
+    /// class; execution also acquires the pod-wide CPU ceiling.
+    pub(crate) async fn admit_provider_work(
         &self,
         work: &'static str,
     ) -> Result<CpuWorkPermit, HttpError> {
+        self.admit_bounded_work(
+            &self.provider_work_semaphore,
+            &self.provider_work_inflight,
+            work,
+        )
+        .await
+    }
+
+    /// Admits one MLT tile transcode. Its backlog and shed ceiling are isolated
+    /// from terrain and provider work; execution shares the pod-wide ceiling.
+    pub(crate) async fn admit_transcode_work(&self) -> Result<CpuWorkPermit, HttpError> {
+        self.admit_bounded_work(
+            &self.transcode_work_semaphore,
+            &self.transcode_work_inflight,
+            "mlt_transcode",
+        )
+        .await
+    }
+
+    /// Shed-then-queue admission: reserves an in-flight slot (shedding with
+    /// `503` at the `cpu_work_max_inflight` ceiling), then waits for the class's
+    /// own execution permit and the pod-wide execution ceiling.
+    async fn admit_bounded_work(
+        &self,
+        semaphore: &Arc<tokio::sync::Semaphore>,
+        inflight: &Arc<AtomicUsize>,
+        work: &'static str,
+    ) -> Result<CpuWorkPermit, HttpError> {
         let queue_started = std::time::Instant::now();
-        let slot = CpuWorkSlot::try_reserve(&self.cpu_work_inflight, self.cpu_work_max_inflight)
-            .ok_or_else(|| {
+        let slot =
+            CpuWorkSlot::try_reserve(inflight, self.cpu_work_max_inflight).ok_or_else(|| {
                 self.metrics.record_cpu_work_admission(work, "shed");
                 (
                     StatusCode::SERVICE_UNAVAILABLE,
                     "server overloaded".to_string(),
                 )
             })?;
-        let permit = self
+        let class_permit = semaphore.clone().acquire_owned().await.map_err(|_| {
+            self.metrics.record_cpu_work_admission(work, "shutdown");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "cpu work is shutting down".to_string(),
+            )
+        })?;
+        let global_permit = self
             .cpu_work_semaphore
             .clone()
             .acquire_owned()
@@ -314,6 +476,76 @@ impl AppState {
         self.metrics
             .record_cpu_work_queue_duration(work, queue_started.elapsed());
         Ok(CpuWorkPermit {
+            _class_permit: class_permit,
+            _global_permit: global_permit,
+            _slot: slot,
+        })
+    }
+
+    /// Acquires CPU concurrency for a child stage of an already-admitted
+    /// request. Terrain pipeline admission bounds the number of parents and
+    /// retained neighborhoods, so child decodes and generation queue here
+    /// without consuming or competing for additional `cpu_work_max_inflight`
+    /// slots. Keep the returned permit through the blocking job.
+    pub(crate) async fn acquire_admitted_cpu_work(
+        &self,
+        work: &'static str,
+    ) -> Result<AdmittedCpuWorkPermit, HttpError> {
+        let queue_started = std::time::Instant::now();
+        let permit = AdmittedCpuWorkPermit::acquire(
+            self.terrain_work_semaphore.clone(),
+            self.cpu_work_semaphore.clone(),
+        )
+        .await
+        .map_err(|_| {
+            self.metrics.record_cpu_work_admission(work, "shutdown");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "cpu work is shutting down".to_string(),
+            )
+        })?;
+        self.metrics.record_cpu_work_admission(work, "accepted");
+        self.metrics
+            .record_cpu_work_queue_duration(work, queue_started.elapsed());
+        Ok(permit)
+    }
+
+    /// Admits one derived-terrain pipeline (neighborhood fetch through
+    /// generation). Unlike [`Self::admit_cpu_work`], this is acquired *before*
+    /// the neighborhood fetch: with the supported 512px square DEM contract,
+    /// each pipeline can retain at most about 9 MiB of decoded samples while it
+    /// fetches and queues for CPU execution. The pipeline count therefore stays
+    /// bounded independently of running CPU work; excess parents get 503.
+    pub(crate) async fn admit_terrain_pipeline(&self) -> Result<TerrainPipelinePermit, HttpError> {
+        let queue_started = std::time::Instant::now();
+        let slot =
+            CpuWorkSlot::try_reserve(&self.terrain_pipeline_inflight, self.cpu_work_max_inflight)
+                .ok_or_else(|| {
+                self.metrics
+                    .record_cpu_work_admission("terrain_pipeline", "shed");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "server overloaded".to_string(),
+                )
+            })?;
+        let permit = self
+            .terrain_pipeline_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| {
+                self.metrics
+                    .record_cpu_work_admission("terrain_pipeline", "shutdown");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "terrain pipeline is shutting down".to_string(),
+                )
+            })?;
+        self.metrics
+            .record_cpu_work_admission("terrain_pipeline", "accepted");
+        self.metrics
+            .record_cpu_work_queue_duration("terrain_pipeline", queue_started.elapsed());
+        Ok(TerrainPipelinePermit {
             _permit: permit,
             _slot: slot,
         })
@@ -342,12 +574,27 @@ fn with_common_layers(router: Router<AppState>, state: AppState) -> Router {
             state.drain.clone(),
             reject_when_draining,
         ))
+        // Keep this inside the metrics layer so deadline responses are observed
+        // as 504s, and outside the handler/drain gate so it bounds the complete
+        // peer-retry plus local-fallback request path.
+        .layer(middleware::from_fn(enforce_request_deadline))
         .layer(middleware::from_fn_with_state(
             state.metrics.clone(),
             track_http_metrics,
         ))
         .layer(middleware::from_fn(propagate_request_id))
         .with_state(state)
+}
+
+async fn enforce_request_deadline(request: Request, next: Next) -> Response {
+    match tokio::time::timeout(HTTP_REQUEST_DEADLINE, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "request exceeded the server deadline",
+        )
+            .into_response(),
+    }
 }
 
 /// Public-facing routes (served on the Gateway-fronted port): content plus the
@@ -664,8 +911,7 @@ async fn track_http_metrics(
     let internal_resource = crate::storage::internal_resource_kind(request.uri().path());
     let endpoint = matched
         .as_ref()
-        .map(MatchedPath::as_str)
-        .unwrap_or("unknown")
+        .map_or("unknown", MatchedPath::as_str)
         .to_string();
     let response = next.run(request).await;
     // Exclude the scrape itself: its handler performs cache-gauge maintenance,
@@ -706,34 +952,67 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
         .metrics
         .set_membership(view.live_ids.len() as i64, view.dead_ids.len() as i64);
     state.metrics.set_drain(state.drain.is_draining());
-    let cpu_inflight = state.cpu_work_inflight.load(Ordering::Relaxed);
-    let cpu_running = state
-        .cpu_work_concurrency
-        .saturating_sub(state.cpu_work_semaphore.available_permits());
+    // Report each CPU class from real counters, plus an `all` aggregate.
+    // `running` is derived from live semaphore occupancy, `inflight` from the
+    // class backlog counters — so a saturated pod shows up instead of the old
+    // always-zero aggregate.
+    let cpu_classes = [
+        (
+            "terrain",
+            &state.terrain_pipeline_inflight,
+            &state.terrain_work_semaphore,
+            state.terrain_work_concurrency,
+        ),
+        (
+            "provider",
+            &state.provider_work_inflight,
+            &state.provider_work_semaphore,
+            state.provider_work_concurrency,
+        ),
+        (
+            "transcode",
+            &state.transcode_work_inflight,
+            &state.transcode_work_semaphore,
+            state.transcode_work_concurrency,
+        ),
+    ];
+    let mut all_inflight = 0usize;
+    for (class, inflight, semaphore, concurrency) in cpu_classes {
+        let inflight = inflight.load(Ordering::Relaxed);
+        let running = concurrency.saturating_sub(semaphore.available_permits());
+        all_inflight = all_inflight.saturating_add(inflight);
+        state.metrics.set_cpu_work(
+            class,
+            inflight,
+            running,
+            concurrency,
+            state.cpu_work_max_inflight,
+        );
+    }
+    // Aggregate `running` comes from the pod ceiling itself, not the per-class
+    // sum: on a tiny pod the class shares sum above the true `N`, so the ceiling
+    // is the honest total.
     state.metrics.set_cpu_work(
-        cpu_inflight,
-        cpu_running,
+        "all",
+        all_inflight,
+        state
+            .cpu_work_concurrency
+            .saturating_sub(state.cpu_work_semaphore.available_permits()),
         state.cpu_work_concurrency,
-        state.cpu_work_max_inflight,
+        state
+            .cpu_work_max_inflight
+            .saturating_mul(CPU_WORK_CLASS_COUNT),
     );
-    state
-        .metrics
-        .set_cache_bytes("tile", state.resource_resolver.tile_cache_weighted_size());
-    state
-        .metrics
-        .set_cache_bytes("chunk", state.resource_resolver.chunk_cache_weighted_size());
-    state
-        .metrics
-        .set_cache_bytes("provider", state.provider_fetch_cache.weighted_size());
-    state
-        .metrics
-        .set_cache_bytes("mlt", state.mlt_cache.weighted_size());
-    state
-        .metrics
-        .set_cache_bytes("derived", state.derived_tile_cache.weighted_size());
-    state
-        .metrics
-        .set_cache_bytes("dem", state.dem_tile_cache.weighted_size());
+    for (cache, bytes) in [
+        ("tile", state.resource_resolver.tile_cache_weighted_size()),
+        ("chunk", state.resource_resolver.chunk_cache_weighted_size()),
+        ("provider", state.provider_fetch_cache.weighted_size()),
+        ("mlt", state.mlt_cache.weighted_size()),
+        ("derived", state.derived_tile_cache.weighted_size()),
+        ("dem", state.dem_tile_cache.weighted_size()),
+    ] {
+        state.metrics.set_cache_bytes(cache, bytes);
+    }
     state
         .metrics
         .sync_backend_fetch_bytes(state.resource_resolver.received_bytes());
@@ -761,7 +1040,9 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use super::{
-        CpuWorkSlot, DecodedDemExpiry, DerivedTileExpiry, get_origin, is_reflectable_host,
+        AdmittedCpuWorkPermit, CpuWorkSlot, DecodedDemExpiry, DerivedTileExpiry,
+        decoded_dem_cache_weight, derived_tile_cache_weight, enforce_request_deadline, get_origin,
+        is_reflectable_host, mlt_cache_weight,
     };
     use axum::http::{HeaderValue, header};
     use moka::Expiry;
@@ -784,6 +1065,126 @@ mod tests {
         drop(second);
         drop(third);
         assert_eq!(inflight.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn cpu_partition_isolates_classes_at_three_permits() {
+        // N = 3: terrain share 1, provider share 1, global 3. A saturated
+        // terrain class (holding its 1 class permit + 1 global) must not block
+        // the provider class — the class shares reserve provider's slot.
+        let terrain = Arc::new(tokio::sync::Semaphore::new(1));
+        let provider = Arc::new(tokio::sync::Semaphore::new(1));
+        let global = Arc::new(tokio::sync::Semaphore::new(3));
+        let _terrain = AdmittedCpuWorkPermit::acquire(terrain, global.clone())
+            .await
+            .expect("terrain permit");
+
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            AdmittedCpuWorkPermit::acquire(provider, global),
+        )
+        .await
+        .expect("provider must not wait on a saturated terrain class at N=3")
+        .expect("provider permit");
+    }
+
+    #[tokio::test]
+    async fn cpu_pod_ceiling_binds_below_three_permits() {
+        // N = 1: class shares floor at 1 each (sum 3) but the pod ceiling is 1,
+        // so total concurrent CPU work is 1 — the cgroup limit holds even though
+        // full class isolation is impossible at a single permit.
+        let terrain = Arc::new(tokio::sync::Semaphore::new(1));
+        let provider = Arc::new(tokio::sync::Semaphore::new(1));
+        let global = Arc::new(tokio::sync::Semaphore::new(1));
+        let _terrain = AdmittedCpuWorkPermit::acquire(terrain, global.clone())
+            .await
+            .expect("terrain permit");
+
+        let waiter = {
+            let global = global.clone();
+            tokio::spawn(async move { AdmittedCpuWorkPermit::acquire(provider, global).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "the pod ceiling of one must serialize CPU work"
+        );
+        waiter.abort();
+    }
+
+    #[test]
+    fn degraded_and_absent_cache_weights_have_a_floor_and_charge_payload() {
+        let key = crate::server::tileset::terrain::DerivedTileKey::for_test();
+        let tiny = DerivedOutcome::Degraded(crate::pmtiles::TileData {
+            bytes: bytes::Bytes::new(),
+            content_type: "application/vnd.mapbox-vector-tile",
+            content_encoding: None,
+        });
+        assert!(derived_tile_cache_weight(&key, &tiny) >= 128);
+        assert!(derived_tile_cache_weight(&key, &DerivedOutcome::Absent) >= 128);
+
+        let payload_len = 4096;
+        let large = DerivedOutcome::Degraded(crate::pmtiles::TileData {
+            bytes: bytes::Bytes::from(vec![0; payload_len]),
+            content_type: "application/vnd.mapbox-vector-tile",
+            content_encoding: None,
+        });
+        assert!(derived_tile_cache_weight(&key, &large) > payload_len as u32);
+
+        let dem_key = (crate::interned::TilesetId::new_unchecked("terrain"), 1);
+        assert!(decoded_dem_cache_weight(&dem_key, &None) >= 128);
+    }
+
+    #[tokio::test]
+    async fn tiny_mlt_entries_charge_overhead_and_obey_capacity() {
+        let tiny = bytes::Bytes::new();
+        let short_key = (crate::interned::TilesetId::new_unchecked("a"), 1);
+        assert_eq!(mlt_cache_weight(&short_key, &tiny), 128);
+
+        let long_key = (
+            crate::interned::TilesetId::new_unchecked(&"a".repeat(256)),
+            2,
+        );
+        assert!(mlt_cache_weight(&long_key, &tiny) > 128);
+
+        let cache = moka::future::Cache::builder()
+            .max_capacity(256)
+            .weigher(mlt_cache_weight)
+            .build();
+        for tile_id in 0..3 {
+            cache
+                .insert(
+                    (crate::interned::TilesetId::new_unchecked("tiny"), tile_id),
+                    tiny.clone(),
+                )
+                .await;
+        }
+        cache.run_pending_tasks().await;
+        assert!(cache.weighted_size() <= 256);
+        assert!(cache.entry_count() <= 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn server_deadline_cancels_a_stuck_request() {
+        use axum::{Router, body::Body, http::Request, middleware, routing::get};
+        use tower::ServiceExt;
+
+        let router = Router::new()
+            .route(
+                "/stuck",
+                get(|| async { std::future::pending::<&'static str>().await }),
+            )
+            .layer(middleware::from_fn(enforce_request_deadline));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/stuck")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::GATEWAY_TIMEOUT);
     }
 
     #[test]
@@ -845,6 +1246,21 @@ mod tests {
                 Instant::now(),
             ),
             None
+        );
+        // A tile generated after a transient failure or mutable in-world
+        // neighbor absence re-resolves on the same short TTL as a center
+        // absence, so the seam heals instead of persisting until eviction.
+        assert_eq!(
+            expiry.expire_after_create(
+                &key,
+                &DerivedOutcome::Degraded(crate::pmtiles::TileData {
+                    bytes: bytes::Bytes::new(),
+                    content_type: "application/vnd.mapbox-vector-tile",
+                    content_encoding: None,
+                }),
+                Instant::now(),
+            ),
+            Some(Duration::from_secs(45))
         );
     }
 

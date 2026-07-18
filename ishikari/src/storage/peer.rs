@@ -5,11 +5,14 @@ use std::{
     collections::HashMap,
     future::Future,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bytes::Bytes;
 use reqwest::{Client, StatusCode, header};
 use thiserror::Error;
@@ -21,9 +24,21 @@ use crate::{
     membership::{Membership, Peer},
     metrics::NodeMetrics,
     pmtiles::BootstrapTransfer,
+    singleflight::{Flight, SingleFlight},
 };
 
 use super::routing::{HrwRouter, ScoredPeer};
+
+/// Maximum concurrent distinct peer fetches this node leads. Bounds connecting
+/// and header-waiting sockets and request tasks (the response-body budget only
+/// bounds bytes *after* headers). Single-flight collapses duplicates, so this
+/// caps distinct `(peer, path)` fetches; on overload a request falls back to a
+/// local read rather than opening an unbounded number of peer connections.
+const PEER_FETCH_CONCURRENCY: usize = 64;
+/// Maximum peer-fetch callers admitted at once, including single-flight
+/// followers. This bounds request futures and follower subscriptions as well
+/// as the distinct leader sockets bounded by `PEER_FETCH_CONCURRENCY`.
+const PEER_FETCH_MAX_INFLIGHT: usize = PEER_FETCH_CONCURRENCY * 8;
 
 /// Peer-backed internal transport for routed resources.
 #[derive(Clone)]
@@ -33,8 +48,43 @@ pub struct PeerBackend {
     router: HrwRouter,
     transport: Arc<dyn InternalTransport>,
     retryable_failures: Arc<Mutex<HashMap<String, HashMap<&'static str, Instant>>>>,
-    inflight_fetches: Arc<Mutex<HashMap<(String, String), usize>>>,
+    /// Collapses identical concurrent `(peer, path)` fetches into one transport
+    /// call; followers reuse the leader's result instead of opening their own
+    /// connection.
+    peer_fetch_singleflight: SingleFlight<(String, String), PeerFetchOutcome>,
+    /// Bounds leaders plus followers before they enter single-flight state.
+    peer_fetch_inflight: Arc<AtomicUsize>,
+    /// Bounds concurrent distinct peer fetches (see [`PEER_FETCH_CONCURRENCY`]).
+    peer_fetch_permits: Arc<tokio::sync::Semaphore>,
     metrics: NodeMetrics,
+}
+
+/// Cloneable single-flight outcome shared from a leader peer fetch to its
+/// followers.
+type PeerFetchOutcome = Result<InternalFetchResponse, PeerFetchError>;
+
+struct PeerFetchSlot {
+    inflight: Arc<AtomicUsize>,
+}
+
+impl PeerFetchSlot {
+    fn try_reserve(inflight: &Arc<AtomicUsize>, max: usize) -> Option<Self> {
+        let previous = inflight.fetch_add(1, Ordering::AcqRel);
+        if previous >= max {
+            inflight.fetch_sub(1, Ordering::AcqRel);
+            None
+        } else {
+            Some(Self {
+                inflight: Arc::clone(inflight),
+            })
+        }
+    }
+}
+
+impl Drop for PeerFetchSlot {
+    fn drop(&mut self) {
+        self.inflight.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 const PEER_RETRY_BACKOFF: Duration = Duration::from_secs(1);
@@ -44,6 +94,12 @@ const PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// does not retry another owner while the first is still completing.
 const PROVIDER_PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const DERIVED_PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Aggregate bytes that active peer-response readers may buffer in this
+/// process. Retained tile/provider caches have their own independent capacities.
+const PEER_RESPONSE_BUFFER_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+/// A saturated node falls back to another owner/local work instead of leaving
+/// an unbounded number of responses waiting with open connections.
+const PEER_RESPONSE_BUFFER_BUDGET_WAIT: Duration = Duration::from_millis(250);
 
 pub type PeerFuture<'a> = Pin<Box<dyn Future<Output = Arc<[Peer]>> + Send + 'a>>;
 pub type FetchFuture<'a> =
@@ -80,6 +136,7 @@ impl InternalTileSource {
 }
 
 /// Body and optional metadata returned by Ishikari's internal transport.
+#[derive(Clone, Debug)]
 pub struct InternalFetchResponse {
     pub bytes: Bytes,
     pub tile_source: Option<InternalTileSource>,
@@ -148,6 +205,32 @@ impl PeerDirectory for MembershipPeerDirectory {
 #[derive(Clone)]
 struct HttpInternalTransport {
     http_client: Client,
+    response_buffer_budget: Arc<tokio::sync::Semaphore>,
+    response_buffer_budget_wait: Duration,
+}
+
+impl HttpInternalTransport {
+    fn new(http_client: Client) -> Self {
+        Self::with_response_buffer_budget(
+            http_client,
+            Arc::new(tokio::sync::Semaphore::new(
+                PEER_RESPONSE_BUFFER_BUDGET_BYTES,
+            )),
+            PEER_RESPONSE_BUFFER_BUDGET_WAIT,
+        )
+    }
+
+    fn with_response_buffer_budget(
+        http_client: Client,
+        response_buffer_budget: Arc<tokio::sync::Semaphore>,
+        response_buffer_budget_wait: Duration,
+    ) -> Self {
+        Self {
+            http_client,
+            response_buffer_budget,
+            response_buffer_budget_wait,
+        }
+    }
 }
 
 impl InternalTransport for HttpInternalTransport {
@@ -176,7 +259,10 @@ impl InternalTransport for HttpInternalTransport {
             if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
                 return Err(PeerFetchError::Retryable(format!("peer returned {status}")));
             }
-            if !status.is_success() {
+            // Internal endpoints return complete representations only as 200.
+            // Accepting 204 or 206 would turn an empty/partial body into a
+            // successful tile or provider resource and bypass local fallback.
+            if status != StatusCode::OK {
                 return Err(PeerFetchError::Fatal(format!(
                     "peer returned unexpected status {status}"
                 )));
@@ -212,10 +298,13 @@ impl InternalTransport for HttpInternalTransport {
                 .get(header::CONTENT_ENCODING)
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned);
-            let bytes = response
-                .bytes()
-                .await
-                .map_err(|error| PeerFetchError::Fatal(error.to_string()))?;
+            let bytes = read_bounded_peer_body(
+                response,
+                peer_response_limit(path),
+                Arc::clone(&self.response_buffer_budget),
+                self.response_buffer_budget_wait,
+            )
+            .await?;
             Ok(InternalFetchResponse {
                 bytes,
                 tile_source,
@@ -229,6 +318,57 @@ impl InternalTransport for HttpInternalTransport {
     }
 }
 
+/// Buffers a peer response body up to `limit` bytes. A buggy, compromised, or
+/// version-incompatible peer must not be able to exhaust this node's memory
+/// with an oversized response; the request timeout bounds duration, not bytes.
+async fn read_bounded_peer_body(
+    mut response: reqwest::Response,
+    limit: usize,
+    response_buffer_budget: Arc<tokio::sync::Semaphore>,
+    budget_wait: Duration,
+) -> Result<Bytes, PeerFetchError> {
+    let content_length = response.content_length();
+    if content_length.is_some_and(|length| length > limit as u64) {
+        return Err(PeerFetchError::Fatal(format!(
+            "peer response exceeds the {limit}-byte internal limit"
+        )));
+    }
+
+    // Known-length bodies reserve exactly their declared buffer. Chunked or
+    // otherwise unknown bodies reserve the full per-resource ceiling before
+    // reading, so concurrent streams cannot collectively exceed the budget.
+    let reservation_bytes = content_length
+        .map_or(limit, |length| length as usize)
+        .max(1);
+    let reservation_permits = u32::try_from(reservation_bytes).map_err(|_| {
+        PeerFetchError::Fatal("peer response buffer reservation is too large".to_string())
+    })?;
+    let _budget = tokio::time::timeout(
+        budget_wait,
+        response_buffer_budget.acquire_many_owned(reservation_permits),
+    )
+    .await
+    .map_err(|_| {
+        PeerFetchError::Retryable("peer response buffer budget wait timed out".to_string())
+    })?
+    .map_err(|_| PeerFetchError::Fatal("peer response buffer budget closed".to_string()))?;
+
+    let mut body = bytes::BytesMut::with_capacity(content_length.unwrap_or(0) as usize);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| PeerFetchError::Fatal(error.to_string()))?
+    {
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err(PeerFetchError::Fatal(format!(
+                "peer response exceeds the {limit}-byte internal limit"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body.freeze())
+}
+
 fn peer_request_timeout(path: &str) -> Duration {
     if path.starts_with("/_internal/derived/") {
         DERIVED_PEER_REQUEST_TIMEOUT
@@ -239,8 +379,20 @@ fn peer_request_timeout(path: &str) -> Duration {
     }
 }
 
+/// Maximum accepted internal response body per resource class. Provider bodies
+/// are bounded by their own source limits (largest: the 8 MiB sprite PNG);
+/// tiles, PMTiles sections, and derived products get a generous shared ceiling
+/// far above any legitimate payload.
+fn peer_response_limit(path: &str) -> usize {
+    if path.starts_with("/_internal/provider/") {
+        8 * 1024 * 1024
+    } else {
+        32 * 1024 * 1024
+    }
+}
+
 /// Errors returned while fetching internal resources from a peer.
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, Error)]
 pub enum PeerFetchError {
     #[error("peer resource not found")]
     NotFound,
@@ -269,7 +421,7 @@ impl PeerBackend {
             self_node_id,
             Arc::new(MembershipPeerDirectory { membership }),
             router,
-            Arc::new(HttpInternalTransport { http_client }),
+            Arc::new(HttpInternalTransport::new(http_client)),
             metrics,
         )
     }
@@ -288,7 +440,9 @@ impl PeerBackend {
             router,
             transport,
             retryable_failures: Arc::new(Mutex::new(HashMap::new())),
-            inflight_fetches: Arc::new(Mutex::new(HashMap::new())),
+            peer_fetch_singleflight: SingleFlight::default(),
+            peer_fetch_inflight: Arc::new(AtomicUsize::new(0)),
+            peer_fetch_permits: Arc::new(tokio::sync::Semaphore::new(PEER_FETCH_CONCURRENCY)),
             metrics,
         }
     }
@@ -515,17 +669,58 @@ impl PeerBackend {
         path: &str,
         kind: &str,
     ) -> Result<InternalFetchResponse, PeerFetchError> {
-        let (inflight_guard, duplicate) = PeerFetchGuard::enter(
-            Arc::clone(&self.inflight_fetches),
-            (peer.id.clone(), path.to_string()),
-        );
         let resource = peer_resource_label(kind);
-        if duplicate {
-            self.metrics.record_peer_fetch_duplicate_inflight(resource);
+        let _slot = PeerFetchSlot::try_reserve(&self.peer_fetch_inflight, PEER_FETCH_MAX_INFLIGHT)
+            .ok_or_else(|| {
+                PeerFetchError::Retryable(
+                    "peer fetch admission saturated; falling back local".to_string(),
+                )
+            })?;
+        let key = (peer.id.clone(), path.to_string());
+        loop {
+            match self.peer_fetch_singleflight.begin(key.clone()) {
+                Flight::Leader(leader) => {
+                    // Bounded admission: shed to a local read rather than open
+                    // an unbounded number of peer connections. Shedding is not a
+                    // peer failure, so it is neither recorded as a forward
+                    // outcome nor backed off.
+                    let Ok(_permit) = Arc::clone(&self.peer_fetch_permits).try_acquire_owned()
+                    else {
+                        let shed = PeerFetchError::Retryable(
+                            "peer fetch admission saturated; falling back local".to_string(),
+                        );
+                        leader.complete_with_error(Err(shed.clone()));
+                        return Err(shed);
+                    };
+                    let result = self.transport.fetch(peer, path).await;
+                    self.record_peer_fetch_outcome(&peer.id, resource, &result);
+                    // Share the leader's result with every current follower,
+                    // then return it. The clone is cheap: `Bytes` is refcounted.
+                    leader.complete_with(result.clone());
+                    return result;
+                }
+                Flight::Follower(follower) => {
+                    self.metrics.record_peer_fetch_duplicate_inflight(resource);
+                    match follower.wait().await {
+                        Some(outcome) => return outcome,
+                        // The leader was cancelled before publishing a result
+                        // (e.g. its request future was dropped); re-elect.
+                        None => continue,
+                    }
+                }
+            }
         }
-        let result = self.transport.fetch(peer, path).await;
-        drop(inflight_guard);
-        let outcome = match &result {
+    }
+
+    /// Records forward/fetch metrics for a leader peer fetch and updates the
+    /// per-resource retry backoff.
+    fn record_peer_fetch_outcome(
+        &self,
+        peer_id: &str,
+        resource: &'static str,
+        result: &Result<InternalFetchResponse, PeerFetchError>,
+    ) {
+        let outcome = match result {
             Ok(_) => "success",
             Err(PeerFetchError::NotFound) => "not_found",
             Err(PeerFetchError::Retryable(_)) => "retryable",
@@ -540,16 +735,15 @@ impl PeerBackend {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if result.as_ref().is_err_and(PeerFetchError::is_retryable) {
             failures
-                .entry(peer.id.clone())
+                .entry(peer_id.to_string())
                 .or_default()
                 .insert(resource, Instant::now() + PEER_RETRY_BACKOFF);
-        } else if let Some(resources) = failures.get_mut(&peer.id) {
+        } else if let Some(resources) = failures.get_mut(peer_id) {
             resources.remove(resource);
             if resources.is_empty() {
-                failures.remove(&peer.id);
+                failures.remove(peer_id);
             }
         }
-        result
     }
 
     fn route_with_backoff(
@@ -604,45 +798,6 @@ impl PeerBackend {
             .cloned()
             .collect::<Vec<_>>();
         Cow::Owned(available)
-    }
-}
-
-struct PeerFetchGuard {
-    inflight: Arc<Mutex<HashMap<(String, String), usize>>>,
-    key: (String, String),
-}
-
-impl PeerFetchGuard {
-    fn enter(
-        inflight: Arc<Mutex<HashMap<(String, String), usize>>>,
-        key: (String, String),
-    ) -> (Self, bool) {
-        let duplicate = {
-            let mut requests = inflight
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let count = requests.entry(key.clone()).or_default();
-            let duplicate = *count > 0;
-            *count += 1;
-            duplicate
-        };
-        (Self { inflight, key }, duplicate)
-    }
-}
-
-impl Drop for PeerFetchGuard {
-    fn drop(&mut self) {
-        let mut requests = self
-            .inflight
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(count) = requests.get_mut(&self.key) else {
-            return;
-        };
-        *count -= 1;
-        if *count == 0 {
-            requests.remove(&self.key);
-        }
     }
 }
 
@@ -713,14 +868,18 @@ fn decode_bootstrap_wire(body: Bytes, include_metadata: bool) -> Result<Bootstra
         });
     }
     anyhow::ensure!(body.len() >= 8, "bootstrap transfer too short");
-    let bootstrap_len = u64::from_le_bytes(body[..8].try_into().unwrap()) as usize;
-    anyhow::ensure!(
-        body.len() >= 8 + bootstrap_len,
-        "bootstrap transfer truncated"
-    );
-    let bootstrap = body.slice(8..8 + bootstrap_len);
-    let metadata = if body.len() > 8 + bootstrap_len {
-        Some(body.slice(8 + bootstrap_len..))
+    // The length is peer-supplied. Compute the end offset with checked math so a
+    // hostile `u64::MAX` cannot overflow the add (debug panic) or wrap past the
+    // length check into an out-of-range `Bytes::slice` (release panic).
+    let bootstrap_len = u64::from_le_bytes(body[..8].try_into().unwrap());
+    let bootstrap_end = usize::try_from(bootstrap_len)
+        .ok()
+        .and_then(|len| len.checked_add(8))
+        .filter(|&end| end <= body.len())
+        .context("bootstrap transfer truncated")?;
+    let bootstrap = body.slice(8..bootstrap_end);
+    let metadata = if body.len() > bootstrap_end {
+        Some(body.slice(bootstrap_end..))
     } else {
         None
     };
@@ -735,21 +894,47 @@ mod tests {
     use std::{
         collections::BTreeSet,
         net::SocketAddr,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        },
+        time::Duration,
     };
 
     use bytes::Bytes;
-    use tokio::sync::{Barrier, Semaphore};
+    use tokio::sync::Semaphore;
 
     use super::{
         DERIVED_PEER_REQUEST_TIMEOUT, FetchFuture, InternalFetchResponse, InternalTileSource,
         InternalTransport, PEER_REQUEST_TIMEOUT, PEER_RETRY_BACKOFF, PROVIDER_PEER_REQUEST_TIMEOUT,
-        PeerBackend, PeerDirectory, PeerFetchError, PeerFuture, internal_resource_kind,
-        peer_request_timeout,
+        PeerBackend, PeerDirectory, PeerFetchError, PeerFetchSlot, PeerFuture,
+        decode_bootstrap_wire, internal_resource_kind, peer_request_timeout,
     };
     use crate::{
         interned::TilesetId, membership::Peer, metrics::NodeMetrics, storage::routing::HrwRouter,
     };
+
+    #[test]
+    fn bootstrap_wire_rejects_a_hostile_length_without_panicking() {
+        // A peer claims a `u64::MAX`-byte bootstrap in an 8-byte body. Without
+        // checked math this overflows the end offset and panics in `slice`.
+        let mut body = Vec::from(u64::MAX.to_le_bytes());
+        let hostile = decode_bootstrap_wire(Bytes::from(body.clone()), true);
+        assert!(hostile.is_err(), "hostile length must be rejected");
+
+        // A length that exceeds the actual body is truncated, not sliced OOB.
+        body.extend_from_slice(&[1, 2, 3]);
+        let truncated_len = &mut body[..8];
+        truncated_len.copy_from_slice(&100_u64.to_le_bytes());
+        assert!(decode_bootstrap_wire(Bytes::from(body), true).is_err());
+
+        // A well-formed transfer still splits correctly at the boundary.
+        let mut ok = Vec::from(2_u64.to_le_bytes());
+        ok.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        let transfer = decode_bootstrap_wire(Bytes::from(ok), true).expect("valid transfer");
+        assert_eq!(transfer.bootstrap.as_ref(), &[0xAA, 0xBB]);
+        assert_eq!(transfer.metadata.as_deref(), Some(&[0xCC][..]));
+    }
 
     struct StaticPeerDirectory {
         peers: Vec<Peer>,
@@ -769,14 +954,14 @@ mod tests {
     }
 
     struct BlockingTransport {
-        started: Barrier,
+        fetch_count: AtomicUsize,
         release: Semaphore,
     }
 
     impl BlockingTransport {
         fn new() -> Self {
             Self {
-                started: Barrier::new(3),
+                fetch_count: AtomicUsize::new(0),
                 release: Semaphore::new(0),
             }
         }
@@ -785,7 +970,7 @@ mod tests {
     impl InternalTransport for BlockingTransport {
         fn fetch<'a>(&'a self, _peer: &'a Peer, _path: &'a str) -> FetchFuture<'a> {
             Box::pin(async move {
-                self.started.wait().await;
+                self.fetch_count.fetch_add(1, AtomicOrdering::SeqCst);
                 self.release
                     .acquire()
                     .await
@@ -866,6 +1051,17 @@ mod tests {
             Some("derived")
         );
         assert_eq!(internal_resource_kind("/_internal/metrics"), None);
+    }
+
+    #[test]
+    fn peer_fetch_admission_sheds_and_releases_on_drop() {
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let slot = PeerFetchSlot::try_reserve(&inflight, 1).expect("first peer fetch admitted");
+        assert!(PeerFetchSlot::try_reserve(&inflight, 1).is_none());
+        assert_eq!(inflight.load(AtomicOrdering::Acquire), 1);
+        drop(slot);
+        assert_eq!(inflight.load(AtomicOrdering::Acquire), 0);
+        assert!(PeerFetchSlot::try_reserve(&inflight, 1).is_some());
     }
 
     #[tokio::test]
@@ -999,7 +1195,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn identical_concurrent_peer_fetches_are_measured_and_cleaned_up() {
+    async fn identical_concurrent_peer_fetches_collapse_into_one_transport_call() {
         let transport = Arc::new(BlockingTransport::new());
         let metrics = NodeMetrics::new();
         let backend = PeerBackend::with_dependencies(
@@ -1025,28 +1221,32 @@ mod tests {
             async move { backend.fetch_tile_bytes(&target, &tileset, 42).await }
         });
 
-        transport.started.wait().await;
-        assert_eq!(metrics.snapshot().peer_tile_duplicate_inflight, 1);
-        assert_eq!(
-            backend
-                .inflight_fetches
-                .lock()
-                .expect("inflight fetch mutex poisoned")
-                .values()
-                .copied()
-                .collect::<Vec<_>>(),
-            vec![2]
-        );
+        // Wait until the leader has hit the transport once and the follower has
+        // attached (recording exactly one duplicate) — single-flight, not two
+        // independent connections.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if transport.fetch_count.load(AtomicOrdering::SeqCst) == 1
+                    && metrics.snapshot().peer_tile_duplicate_inflight == 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("leader fetches once while the follower coalesces");
 
-        transport.release.add_permits(2);
-        first.await.expect("first task").expect("first fetch");
-        second.await.expect("second task").expect("second fetch");
-        assert!(
-            backend
-                .inflight_fetches
-                .lock()
-                .expect("inflight fetch mutex poisoned")
-                .is_empty()
+        // Releasing only the single leader fetch satisfies both callers.
+        transport.release.add_permits(1);
+        let first = first.await.expect("first task").expect("first fetch");
+        let second = second.await.expect("second task").expect("second fetch");
+        assert_eq!(first.bytes, Bytes::from_static(b"peer response"));
+        assert_eq!(second.bytes, Bytes::from_static(b"peer response"));
+        assert_eq!(
+            transport.fetch_count.load(AtomicOrdering::SeqCst),
+            1,
+            "the duplicate must not open a second transport fetch"
         );
     }
 
@@ -1184,5 +1384,212 @@ mod tests {
         assert!(
             encoded.contains("ishikari_peer_fetch_total{outcome=\"success\",resource=\"leaf\"} 1")
         );
+    }
+
+    #[test]
+    fn provider_paths_use_the_tighter_response_limit() {
+        assert_eq!(
+            super::peer_response_limit("/_internal/provider/styles/base/style.json"),
+            8 * 1024 * 1024
+        );
+        assert_eq!(
+            super::peer_response_limit("/_internal/tiles/demo/42"),
+            32 * 1024 * 1024
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_transport_accepts_only_exact_200() {
+        use std::future::IntoFuture;
+
+        use axum::{Router, http::StatusCode, routing::get};
+
+        let router = Router::new()
+            .route("/no-content", get(|| async { StatusCode::NO_CONTENT }))
+            .route(
+                "/partial",
+                get(|| async { (StatusCode::PARTIAL_CONTENT, "partial") }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind peer");
+        let addr = listener.local_addr().expect("peer addr");
+        tokio::spawn(axum::serve(listener, router).into_future());
+        let transport = super::HttpInternalTransport::new(reqwest::Client::new());
+        let peer = peer_at("peer-status", addr);
+
+        for (path, status) in [
+            ("/no-content", StatusCode::NO_CONTENT),
+            ("/partial", StatusCode::PARTIAL_CONTENT),
+        ] {
+            let error = transport
+                .fetch(&peer, path)
+                .await
+                .expect_err("non-200 success must be rejected");
+            assert!(matches!(error, PeerFetchError::Fatal(_)), "{error}");
+            assert!(error.to_string().contains(status.as_str()), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn aggregate_peer_response_buffer_budget_has_bounded_wait() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            sync::Notify,
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind budget peer");
+        let addr = listener.local_addr().expect("budget peer addr");
+        let release_first = Arc::new(Notify::new());
+        tokio::spawn({
+            let release_first = Arc::clone(&release_first);
+            async move {
+                for _ in 0..2 {
+                    let (mut socket, _) = listener.accept().await.expect("accept budget peer");
+                    let release_first = Arc::clone(&release_first);
+                    tokio::spawn(async move {
+                        let mut request = [0u8; 1024];
+                        let read = socket.read(&mut request).await.expect("read request");
+                        let request = String::from_utf8_lossy(&request[..read]);
+                        socket
+                            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\n")
+                            .await
+                            .expect("write response head");
+                        if request.contains("/first") {
+                            socket.write_all(b"a").await.expect("write first byte");
+                            release_first.notified().await;
+                            let _ = socket.write_all(b"bcde").await;
+                        } else {
+                            let _ = socket.write_all(b"12345").await;
+                        }
+                    });
+                }
+            }
+        });
+
+        let budget = Arc::new(Semaphore::new(5));
+        let transport = Arc::new(super::HttpInternalTransport::with_response_buffer_budget(
+            reqwest::Client::new(),
+            Arc::clone(&budget),
+            Duration::from_millis(50),
+        ));
+        let peer = peer_at("peer-budget", addr);
+        let first = tokio::spawn({
+            let transport = Arc::clone(&transport);
+            let peer = peer.clone();
+            async move { transport.fetch(&peer, "/first").await }
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while budget.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first response reserves the budget");
+
+        let error = transport
+            .fetch(&peer, "/second")
+            .await
+            .expect_err("second response must not wait indefinitely for budget");
+        assert!(matches!(error, PeerFetchError::Retryable(_)), "{error}");
+        assert!(
+            error.to_string().contains("budget wait timed out"),
+            "{error}"
+        );
+
+        release_first.notify_one();
+        let response = first.await.expect("first fetch task").expect("first fetch");
+        assert_eq!(response.bytes.as_ref(), b"abcde");
+        assert_eq!(budget.available_permits(), 5);
+    }
+
+    /// A misbehaving peer must not be able to buffer unbounded bytes into this
+    /// node: an oversized declared body is rejected up front, an oversized
+    /// chunked body is rejected mid-stream, and a legitimate body still works.
+    #[tokio::test]
+    async fn oversized_peer_response_bodies_are_rejected() {
+        use std::future::IntoFuture;
+
+        use axum::{Router, routing::get};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let provider_limit = super::peer_response_limit("/_internal/provider/x");
+
+        // Content-Length over the provider limit: rejected before the body.
+        let over = vec![b'x'; provider_limit + 1];
+        let router = Router::new()
+            .route(
+                "/_internal/provider/styles/big/style.json",
+                get(move || async move { over }),
+            )
+            .route(
+                "/_internal/provider/styles/ok/style.json",
+                get(|| async { "small" }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind peer");
+        let addr = listener.local_addr().expect("peer addr");
+        tokio::spawn(axum::serve(listener, router).into_future());
+        let transport = super::HttpInternalTransport::new(reqwest::Client::new());
+        let peer = peer_at("peer-big", addr);
+
+        let error = transport
+            .fetch(&peer, "/_internal/provider/styles/big/style.json")
+            .await
+            .expect_err("oversized declared body must be rejected");
+        assert!(matches!(error, PeerFetchError::Fatal(_)), "{error}");
+        assert!(error.to_string().contains("internal limit"), "{error}");
+
+        let response = transport
+            .fetch(&peer, "/_internal/provider/styles/ok/style.json")
+            .await
+            .expect("in-limit body");
+        assert_eq!(response.bytes.as_ref(), b"small");
+
+        // Chunked transfer with no Content-Length: rejected once the streamed
+        // bytes cross the limit, without buffering the whole flood.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind chunked peer");
+        let chunked_addr = listener.local_addr().expect("chunked addr");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n")
+                .await
+                .expect("head");
+            let chunk = vec![b'x'; 64 * 1024];
+            let head = format!("{:x}\r\n", chunk.len());
+            // Stream well past the provider limit; the client should hang up.
+            for _ in 0..(provider_limit / chunk.len()) + 4 {
+                if socket.write_all(head.as_bytes()).await.is_err()
+                    || socket.write_all(&chunk).await.is_err()
+                    || socket.write_all(b"\r\n").await.is_err()
+                {
+                    return;
+                }
+            }
+            let _ = socket.write_all(b"0\r\n\r\n").await;
+        });
+        let peer = peer_at("peer-chunked", chunked_addr);
+        let error = transport
+            .fetch(&peer, "/_internal/provider/styles/flood/style.json")
+            .await
+            .expect_err("oversized chunked body must be rejected");
+        assert!(matches!(error, PeerFetchError::Fatal(_)), "{error}");
+        assert!(error.to_string().contains("internal limit"), "{error}");
+    }
+
+    fn peer_at(id: &str, addr: SocketAddr) -> Peer {
+        Peer {
+            id: id.to_string(),
+            addr,
+        }
     }
 }

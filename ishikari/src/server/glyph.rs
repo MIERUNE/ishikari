@@ -8,9 +8,9 @@ use axum::{
 };
 
 use crate::server::{
-    AppState, HttpError, bytes_response,
-    provider::path_percent_encode,
-    upstream::{ProviderResource, fetch_limited_bytes_with_content_type},
+    AppState, HttpError,
+    provider::{path_percent_encode, provider_routing_key},
+    upstream::{ProviderResource, fetch_limited_bytes_with_content_type, route_or_fetch_provider},
 };
 
 const MAX_FONTSTACK_LEN: usize = 256;
@@ -31,12 +31,7 @@ pub(crate) async fn glyph_handler(
     let range = validate_range(&range)?;
     let upstream = resolve_glyph_url(&state, &fontstack, &range)?;
     let resource = route_glyph_bytes(&state, &fontstack, &range, &upstream).await?;
-    if resource.not_modified(&headers) {
-        return Ok(resource.not_modified_response());
-    }
-    let mut response = bytes_response(resource.bytes().clone(), "application/x-protobuf", None);
-    resource.apply_public_headers(response.headers_mut());
-    Ok(response)
+    Ok(resource.verbatim_public_response(&headers, "application/x-protobuf"))
 }
 
 pub(crate) async fn internal_glyph_handler(
@@ -50,9 +45,7 @@ pub(crate) async fn internal_glyph_handler(
     state
         .metrics
         .add_internal_bytes(resource.bytes().len() as u64);
-    let mut response = bytes_response(resource.bytes().clone(), "application/x-protobuf", None);
-    resource.apply_internal_headers(response.headers_mut());
-    Ok(response)
+    Ok(resource.verbatim_internal_response("application/x-protobuf"))
 }
 
 fn resolve_glyph_url(state: &AppState, fontstack: &str, range: &str) -> Result<String, HttpError> {
@@ -73,26 +66,20 @@ async fn route_glyph_bytes(
     range: &str,
     upstream: &str,
 ) -> Result<ProviderResource, HttpError> {
-    let key = format!("glyph:{upstream}");
+    let key = provider_routing_key("glyph", upstream);
     let path = format!(
         "/_internal/provider/fonts/{}/{}.pbf",
         path_percent_encode(fontstack),
         range
     );
-    if let Some(response) = state
-        .resource_resolver
-        .route_provider_resource(&key, &path, "glyph")
-        .await
-        .map_err(|error| {
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("glyph peer route failed: {error}"),
-            )
-        })?
-    {
-        return Ok(ProviderResource::from_peer(response));
-    }
-    fetch_glyph_bytes_local(state, upstream.to_string()).await
+    route_or_fetch_provider(
+        state,
+        &key,
+        &path,
+        "glyph",
+        fetch_glyph_bytes_local(state, upstream.to_string()),
+    )
+    .await
 }
 
 async fn fetch_glyph_bytes_local(

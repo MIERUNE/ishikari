@@ -7,7 +7,10 @@ use std::{
 
 use clap::Parser;
 
-use crate::membership;
+use crate::{membership, storage::validate_chunked_store_limits};
+
+const MAX_CPU_WORK_CONCURRENCY: usize = 1_024;
+const MAX_CPU_WORK_INFLIGHT: usize = MAX_CPU_WORK_CONCURRENCY * 64;
 
 /// Resolved application configuration used at startup.
 pub struct Config {
@@ -45,9 +48,11 @@ pub struct Config {
     pub mapterhorn_maxzoom: Option<u8>,
     /// How long an absent Mapterhorn detail archive stays negative-cached.
     pub mapterhorn_negative_ttl: Duration,
-    /// Maximum number of CPU-heavy decode/generate/transcode jobs running per pod.
+    /// Maximum number of CPU-heavy decode/generate/transcode/validation/rewrite
+    /// jobs running per pod.
     pub cpu_work_concurrency: usize,
-    /// Maximum admitted CPU-work units before new work is shed with 503.
+    /// Maximum admitted CPU-work units per class before new work in that class
+    /// is shed with 503.
     pub cpu_work_max_inflight: usize,
 }
 
@@ -162,17 +167,16 @@ pub struct Cli {
         default_value_t = 3600
     )]
     mapterhorn_negative_ttl_secs: u64,
-    /// Maximum number of CPU-heavy DEM decode, terrain generation, and MLT
-    /// transcode jobs running concurrently per pod. Defaults to the effective
-    /// parallelism reported by the runtime (including cgroup limits where the
-    /// platform exposes them).
+    /// Maximum number of CPU-heavy DEM decode, terrain generation, MLT
+    /// transcode, provider JSON validation, and style rewriting jobs running
+    /// concurrently per pod. Defaults to the effective parallelism reported by
+    /// the runtime (including cgroup limits where the platform exposes them).
     #[arg(long = "cpu-work-concurrency", env = "ISKR_CPU_WORK_CONCURRENCY")]
     cpu_work_concurrency: Option<usize>,
-    /// Maximum CPU-work units (terrain generation, DEM decode, MLT transcode)
-    /// admitted at once — holding a concurrency permit or queued for one.
-    /// Requests beyond this are shed with 503 so an extreme flood fails fast
-    /// instead of growing the queue without bound. Defaults to 64x the CPU-work
-    /// concurrency.
+    /// Maximum CPU-work units admitted at once per class — holding a concurrency
+    /// permit or queued for one. Requests beyond the class-local limit are shed
+    /// with 503 so a flood cannot grow that queue or consume another class's
+    /// backlog budget. Defaults to 64x the CPU-work concurrency.
     #[arg(long = "cpu-work-max-inflight", env = "ISKR_CPU_WORK_MAX_INFLIGHT")]
     cpu_work_max_inflight: Option<usize>,
 }
@@ -232,10 +236,34 @@ impl Config {
             }
         }
 
+        let backend_fetch_concurrency = cli.backend_fetch_concurrency.max(1);
+        let chunk_fetch_merge_window = Duration::from_millis(cli.chunk_fetch_merge_window_ms);
+        validate_chunked_store_limits(
+            cli.chunk_size_bytes,
+            cli.max_fetch_chunks,
+            chunk_fetch_merge_window,
+            backend_fetch_concurrency,
+        )
+        .map_err(|error| error.to_string())?;
+
         let cpu_work_concurrency = cli
             .cpu_work_concurrency
             .unwrap_or_else(default_cpu_work_concurrency)
             .max(1);
+        if cpu_work_concurrency > MAX_CPU_WORK_CONCURRENCY {
+            return Err(format!(
+                "CPU work concurrency {cpu_work_concurrency} exceeds the safe maximum {MAX_CPU_WORK_CONCURRENCY}"
+            ));
+        }
+        let cpu_work_max_inflight = cli
+            .cpu_work_max_inflight
+            .unwrap_or_else(|| cpu_work_concurrency.saturating_mul(64))
+            .max(cpu_work_concurrency);
+        if cpu_work_max_inflight > MAX_CPU_WORK_INFLIGHT {
+            return Err(format!(
+                "CPU work max inflight {cpu_work_max_inflight} exceeds the safe maximum {MAX_CPU_WORK_INFLIGHT}"
+            ));
+        }
 
         Ok(Self {
             node_id: node_id.clone(),
@@ -255,9 +283,9 @@ impl Config {
             router_candidate_count: cli.router_candidate_count,
             router_tile_group_size: cli.router_tile_group_size,
             chunk_size_bytes: cli.chunk_size_bytes,
-            max_fetch_chunks: cli.max_fetch_chunks.max(1),
-            chunk_fetch_merge_window: Duration::from_millis(cli.chunk_fetch_merge_window_ms),
-            backend_fetch_concurrency: cli.backend_fetch_concurrency.max(1),
+            max_fetch_chunks: cli.max_fetch_chunks,
+            chunk_fetch_merge_window,
+            backend_fetch_concurrency,
             artificial_backend_delay_ms: cli.artificial_backend_delay_ms,
             tile_cache_max_bytes: cli.tile_cache_max_bytes,
             chunk_cache_max_bytes: cli.chunk_cache_max_bytes,
@@ -275,10 +303,7 @@ impl Config {
             mapterhorn_maxzoom: cli.mapterhorn_maxzoom,
             mapterhorn_negative_ttl: Duration::from_secs(cli.mapterhorn_negative_ttl_secs),
             cpu_work_concurrency,
-            cpu_work_max_inflight: cli
-                .cpu_work_max_inflight
-                .unwrap_or_else(|| cpu_work_concurrency.saturating_mul(64))
-                .max(cpu_work_concurrency),
+            cpu_work_max_inflight,
         })
     }
 }
@@ -293,14 +318,13 @@ fn auto_node_id() -> String {
 }
 
 fn default_cpu_work_concurrency() -> usize {
-    std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(2)
+    std::thread::available_parallelism().map_or(2, std::num::NonZeroUsize::get)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
 
     fn cli() -> Cli {
         Cli {
@@ -333,6 +357,20 @@ mod tests {
             cpu_work_concurrency: Some(2),
             cpu_work_max_inflight: None,
         }
+    }
+
+    fn config_error(cli: Cli) -> String {
+        match Config::from_cli(cli) {
+            Ok(_) => panic!("configuration unexpectedly succeeded"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn cpu_work_help_lists_provider_json_validation_and_style_rewriting() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("provider JSON validation"), "{help}");
+        assert!(help.contains("style rewriting"), "{help}");
     }
 
     #[test]
@@ -387,11 +425,56 @@ mod tests {
     }
 
     #[test]
+    fn excessive_chunk_fetch_merge_window_fails_at_startup() {
+        let mut cli = cli();
+        cli.chunk_fetch_merge_window_ms = 1_001;
+
+        assert!(config_error(cli).contains("chunk fetch merge window"));
+    }
+
+    #[test]
+    fn invalid_chunk_geometry_fails_at_startup() {
+        let mut zero_size = cli();
+        zero_size.chunk_size_bytes = 0;
+        assert!(config_error(zero_size).contains("greater than zero"));
+
+        let mut zero_count = cli();
+        zero_count.max_fetch_chunks = 0;
+        assert!(config_error(zero_count).contains("greater than zero"));
+
+        let mut oversized_span = cli();
+        oversized_span.chunk_size_bytes = 32 * 1024 * 1024;
+        oversized_span.max_fetch_chunks = 4;
+        assert!(config_error(oversized_span).contains("fetch span"));
+
+        let mut oversized_active = cli();
+        oversized_active.chunk_size_bytes = 16 * 1024 * 1024;
+        oversized_active.max_fetch_chunks = 4;
+        oversized_active.backend_fetch_concurrency = 256;
+        assert!(config_error(oversized_active).contains("active backend fetch budget"));
+    }
+
+    #[test]
     fn backend_fetch_concurrency_is_always_positive() {
         let mut cli = cli();
         cli.backend_fetch_concurrency = 0;
         let config = Config::from_cli(cli).expect("zero concurrency is clamped");
         assert_eq!(config.backend_fetch_concurrency, 1);
+    }
+
+    #[test]
+    fn excessive_semaphore_limits_fail_at_startup() {
+        let mut backend = cli();
+        backend.backend_fetch_concurrency = 1_025;
+        assert!(config_error(backend).contains("backend fetch concurrency"));
+
+        let mut cpu = cli();
+        cpu.cpu_work_concurrency = Some(MAX_CPU_WORK_CONCURRENCY + 1);
+        assert!(config_error(cpu).contains("CPU work concurrency"));
+
+        let mut inflight = cli();
+        inflight.cpu_work_max_inflight = Some(MAX_CPU_WORK_INFLIGHT + 1);
+        assert!(config_error(inflight).contains("CPU work max inflight"));
     }
 
     #[test]

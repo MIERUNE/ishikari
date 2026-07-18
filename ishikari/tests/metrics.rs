@@ -56,7 +56,8 @@ fn exposes_cpu_work_admission_queue_and_state() {
     metrics.record_cpu_work_admission("dem_decode", "accepted");
     metrics.record_cpu_work_admission("terrain_generate", "shed");
     metrics.record_cpu_work_queue_duration("dem_decode", Duration::from_millis(20));
-    metrics.set_cpu_work(3, 2, 2, 8);
+    metrics.set_cpu_work("terrain", 3, 2, 2, 8);
+    metrics.set_cpu_work("all", 5, 4, 4, 24);
 
     let encoded = metrics.encode();
     assert!(
@@ -70,10 +71,12 @@ fn exposes_cpu_work_admission_queue_and_state() {
     assert!(
         encoded.contains("ishikari_cpu_work_queue_duration_seconds_count{work=\"dem_decode\"} 1")
     );
-    assert!(encoded.contains("ishikari_cpu_work{state=\"inflight\"} 3"));
-    assert!(encoded.contains("ishikari_cpu_work{state=\"running\"} 2"));
-    assert!(encoded.contains("ishikari_cpu_work{state=\"concurrency\"} 2"));
-    assert!(encoded.contains("ishikari_cpu_work{state=\"max_inflight\"} 8"));
+    assert!(encoded.contains("ishikari_cpu_work{class=\"terrain\",state=\"inflight\"} 3"));
+    assert!(encoded.contains("ishikari_cpu_work{class=\"terrain\",state=\"running\"} 2"));
+    assert!(encoded.contains("ishikari_cpu_work{class=\"terrain\",state=\"concurrency\"} 2"));
+    assert!(encoded.contains("ishikari_cpu_work{class=\"terrain\",state=\"max_inflight\"} 8"));
+    assert!(encoded.contains("ishikari_cpu_work{class=\"all\",state=\"inflight\"} 5"));
+    assert!(encoded.contains("ishikari_cpu_work{class=\"all\",state=\"running\"} 4"));
 }
 
 #[test]

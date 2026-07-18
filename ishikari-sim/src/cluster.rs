@@ -18,6 +18,7 @@ use ishikari::{
         FetchFuture, HrwRouter, InternalTransport, ObjectStoreRegistry, PeerBackend, PeerDirectory,
         PeerFetchError, PeerFuture, PeerTileCachePolicy, ResourceResolver,
         ResourceResolverStorageConfig, TileSource, TilesetId, internal_resource_kind,
+        validate_chunked_store_limits,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -25,9 +26,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     BackendLatencyConfig, TraceEntry,
     membership::SimGossipTransport,
-    report::{
-        ClusterObservation, NodeReport, SchedulerReport, SimReport, add_histograms, add_metrics,
-    },
+    report::{ClusterObservation, NodeReport, SchedulerReport, SimReport},
 };
 
 const SIM_NODE_BASE_PORT: u16 = 10_000;
@@ -90,18 +89,13 @@ impl ClusterConfig {
             self.tile_group_size > 0,
             "tile_group_size must be greater than zero"
         );
-        ensure!(
-            self.chunk_size_bytes > 0,
-            "chunk_size_bytes must be greater than zero"
-        );
-        ensure!(
-            self.max_fetch_chunks > 0,
-            "max_fetch_chunks must be greater than zero"
-        );
-        ensure!(
-            self.backend_fetch_concurrency > 0,
-            "backend_fetch_concurrency must be greater than zero"
-        );
+        validate_chunked_store_limits(
+            self.chunk_size_bytes,
+            self.max_fetch_chunks,
+            Duration::from_millis(self.chunk_fetch_merge_window_ms),
+            self.backend_fetch_concurrency,
+        )
+        .context("invalid chunk storage configuration")?;
         ensure!(
             self.gossip_interval_ms > 0,
             "gossip_interval_ms must be greater than zero"
@@ -501,10 +495,10 @@ impl SimCluster {
     pub async fn observation(&self) -> ClusterObservation {
         let mut metrics = NodeMetricsSnapshot::default();
         for node in &self.retired_nodes {
-            add_metrics(&mut metrics, node.metrics);
+            metrics.merge(&node.metrics);
         }
         for node in &self.nodes {
-            add_metrics(&mut metrics, node.metrics.snapshot());
+            metrics.merge(&node.metrics.snapshot());
         }
         let expected = self.active_node_ids().into_iter().collect::<BTreeSet<_>>();
         let mut membership_converged_nodes = 0;
@@ -552,7 +546,12 @@ impl SimCluster {
                 membership_min_peer_count
             },
             membership_max_peer_count,
-            cache_hits: self.report.l1_cache_hits,
+            cache_hits: self
+                .report
+                .l1_cache_hits
+                .saturating_add(self.report.negative_cache_hits),
+            l1_cache_hits: self.report.l1_cache_hits,
+            negative_cache_hits: self.report.negative_cache_hits,
             by_source: self.report.by_source.clone(),
             node_requests: self
                 .nodes
@@ -595,11 +594,13 @@ impl SimCluster {
         let node = &mut self.nodes[served.node_index];
         self.report.requests += 1;
         node.requests += 1;
-        if matches!(
-            served.source,
-            TileSource::SelfTileCache | TileSource::NegativeCache
-        ) {
-            self.report.l1_cache_hits += 1;
+        // Positive and negative L1 hits are separate report fields: HTTP
+        // replay derives them from distinct production outcomes, and mixing
+        // them made absent-tile workloads incomparable across modes.
+        match served.source {
+            TileSource::SelfTileCache => self.report.l1_cache_hits += 1,
+            TileSource::NegativeCache => self.report.negative_cache_hits += 1,
+            _ => {}
         }
         *node
             .by_source
@@ -659,15 +660,15 @@ impl SimCluster {
             .iter()
             .map(|node| {
                 let node_metrics = node.metrics.snapshot();
-                add_metrics(&mut metrics, node_metrics);
+                metrics.merge(&node_metrics);
                 let node_report = real_node_report(node, true);
-                add_histograms(&mut histograms, &node_report.histograms);
+                histograms.merge(&node_report.histograms);
                 node_report
             })
             .collect::<Vec<_>>();
         for node in &self.retired_nodes {
-            add_metrics(&mut metrics, node.metrics);
-            add_histograms(&mut histograms, &node.histograms);
+            metrics.merge(&node.metrics);
+            histograms.merge(&node.histograms);
         }
         let mut nodes = self.retired_nodes;
         nodes.extend(active_nodes);
@@ -821,6 +822,14 @@ mod tests {
             },
             ClusterConfig {
                 backend_fetch_concurrency: 0,
+                ..ClusterConfig::default()
+            },
+            ClusterConfig {
+                chunk_fetch_merge_window_ms: 1_001,
+                ..ClusterConfig::default()
+            },
+            ClusterConfig {
+                backend_fetch_concurrency: usize::MAX,
                 ..ClusterConfig::default()
             },
             ClusterConfig {

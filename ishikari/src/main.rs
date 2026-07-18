@@ -13,7 +13,7 @@ use ishikari::{
         AppState, TileRuntimeConfig, provider::ProviderConfig, run_http_server,
         tileset::mapterhorn::MapterhornResolver,
     },
-    storage::{ObjectStoreRegistry, ResourceResolver, ResourceResolverConfig},
+    storage::{ObjectStoreRegistry, ResourceResolver, ResourceResolverConfig, redact_source_list},
 };
 
 const DRAINING_PROPAGATION_DELAY: Duration = Duration::from_secs(2);
@@ -42,7 +42,9 @@ async fn main() -> Result<()> {
         gossip_advertise_addr = %config.membership.advertise_addr,
         internal_http_advertise_addr = %config.membership.http_advertise_addr,
         seed_nodes = ?config.membership.seed_nodes,
-        tileset_sources = %config.tileset_sources,
+        // Redacted: the raw value can carry signed query strings, API keys, or
+        // URL userinfo. Log only namespace + scheme + authority.
+        tileset_sources = %redact_source_list(&config.tileset_sources),
         chunk_size_bytes = config.chunk_size_bytes,
         max_fetch_chunks = config.max_fetch_chunks,
         chunk_fetch_merge_window_ms = config.chunk_fetch_merge_window.as_millis(),

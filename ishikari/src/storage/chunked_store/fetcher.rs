@@ -113,6 +113,11 @@ pub enum ChunkFetchError {
     /// matching on the message string.
     #[error("{0}")]
     Timeout(String),
+    /// The process-wide admitted-fetch ceiling is full, so this request is shed
+    /// rather than queued unboundedly. Typed so the service layer maps it to a
+    /// 503 without matching on the message string.
+    #[error("{0}")]
+    Overload(String),
     #[error("{0}")]
     Message(String),
 }
@@ -289,14 +294,16 @@ impl ChunkFetcher {
         let backend_delay = self
             .backend_latency
             .delay(sequence, range_start, prefetched_bytes);
-        if !backend_delay.is_zero() {
-            tokio::time::sleep(backend_delay).await;
-        }
-
-        let fetch_result = tokio::time::timeout(
-            BACKEND_FETCH_TIMEOUT,
-            object_store.get_range(&path, range_start..range_end),
-        )
+        // The deadline covers injected/observed latency and the object-store
+        // operation together. Keeping the artificial delay outside this timeout
+        // allowed detached scheduler tasks to retain backend permits and request
+        // admission long after their callers had reached the outer deadline.
+        let fetch_result = tokio::time::timeout(BACKEND_FETCH_TIMEOUT, async {
+            if !backend_delay.is_zero() {
+                tokio::time::sleep(backend_delay).await;
+            }
+            object_store.get_range(&path, range_start..range_end).await
+        })
         .await;
         let bytes = match fetch_result {
             Ok(Ok(bytes)) => bytes,
@@ -388,9 +395,9 @@ impl From<ObjectStoreError> for ChunkFetchError {
         if matches!(error, ObjectStoreError::NotFound { .. }) {
             return Self::NotFound;
         }
-        Self::Message(format!(
-            "failed to fetch chunk range from object store: {error}"
-        ))
+        // Do not retain the source: object-store errors can contain generated
+        // signed request URLs, which would later be emitted by tileset logs.
+        Self::Message("failed to fetch chunk range from object store".to_string())
     }
 }
 
@@ -499,16 +506,99 @@ fn normalize_source_url(source_url: &str) -> Result<Url> {
         .map_err(|_| anyhow!("failed to convert local path to file:// URL"))
 }
 
+/// Resolves the exact local PMTiles archives used by a set of tileset ids.
+///
+/// This intentionally shares production's source parser and namespace
+/// selection instead of scanning directories. Simulator output guards can
+/// therefore protect nested archives, symlinked paths, and percent-encoded
+/// `file://` roots exactly as the production reader resolves them. Remote
+/// sources contribute no local path.
+#[cfg(feature = "simulator-support")]
+pub fn local_tileset_archive_paths<'a>(
+    spec: &str,
+    tileset_ids: impl IntoIterator<Item = &'a str>,
+) -> Result<Vec<PathBuf>> {
+    let mut namespaces = Vec::new();
+    let mut default = None;
+    for (namespace, source) in parse_source_entries(spec)? {
+        let local_root = local_source_root(&source)?;
+        match namespace {
+            Some(namespace) => namespaces.push((namespace, local_root)),
+            None => default = Some(local_root),
+        }
+    }
+
+    let namespace_names = namespaces
+        .iter()
+        .map(|(namespace, _)| namespace.as_str())
+        .collect::<Vec<_>>();
+    let mut seen = HashSet::new();
+    let mut archives = Vec::new();
+    for tileset_id in tileset_ids {
+        let tileset_id = TilesetId::try_new(tileset_id)
+            .with_context(|| format!("invalid tileset id {tileset_id:?}"))?;
+        let (selected, relative) = select_namespace(tileset_id.as_str(), &namespace_names);
+        let root = match selected {
+            Some(index) => namespaces[index].1.as_ref(),
+            None => default.as_ref().and_then(Option::as_ref),
+        };
+        let Some(root) = root else {
+            continue;
+        };
+        let archive = root.join(format!("{relative}.pmtiles"));
+        if seen.insert(archive.clone()) {
+            archives.push(archive);
+        }
+    }
+    Ok(archives)
+}
+
+#[cfg(feature = "simulator-support")]
+fn local_source_root(source: &str) -> Result<Option<PathBuf>> {
+    let mut url = normalize_source_url(source)?;
+    if url.scheme() != "file" {
+        return Ok(None);
+    }
+    // Object-store selection depends on the URL path; query/fragment metadata
+    // does not name a different local filesystem directory.
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_file_path()
+        .map(Some)
+        .map_err(|_| anyhow!("invalid local source URL"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
+    #[cfg(feature = "simulator-support")]
+    use super::local_tileset_archive_paths;
     use super::{
-        BackendLatencyModel, ChunkFetcher, object_path_under, parse_source_entries,
-        select_namespace,
+        BACKEND_FETCH_TIMEOUT, BackendLatencyModel, ChunkFetchError, ChunkFetcher,
+        object_path_under, parse_source_entries, select_namespace,
     };
     use crate::{interned::TilesetId, metrics::NodeMetrics, storage::ObjectStoreRegistry};
-    use object_store::path::Path as ObjectPath;
+    use object_store::{Error as ObjectStoreError, path::Path as ObjectPath};
+    #[cfg(feature = "simulator-support")]
+    use url::Url;
+
+    #[test]
+    fn chunk_fetch_errors_never_retain_object_store_sources() {
+        let secret = "SECRETTOKEN";
+        let source = std::io::Error::other(format!(
+            "GET https://bucket.example/archive?X-Signature={secret}"
+        ));
+        let error = ChunkFetchError::from(ObjectStoreError::Generic {
+            store: "synthetic",
+            source: Box::new(source),
+        });
+        let message = error.to_string();
+
+        assert_eq!(message, "failed to fetch chunk range from object store");
+        assert!(!message.contains(secret), "{message}");
+        assert!(!message.contains("bucket.example"), "{message}");
+    }
 
     #[test]
     fn parses_default_and_namespaced_entries() {
@@ -577,6 +667,36 @@ mod tests {
             object_path_under(&ObjectPath::default(), "japan").as_ref(),
             "japan.pmtiles"
         );
+    }
+
+    #[cfg(feature = "simulator-support")]
+    #[test]
+    fn exact_local_archive_paths_share_production_routing_and_decode_file_urls() {
+        let root = std::env::temp_dir().join(format!(
+            "ishikari local sources {} {}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("create local source root");
+        let root_url = Url::from_directory_path(&root).expect("file URL");
+        assert!(root_url.as_str().contains("%20"));
+
+        let spec = format!("regional={root_url};default=gs://remote/default");
+        let paths = local_tileset_archive_paths(
+            &spec,
+            ["regional/streets", "regional/streets", "other/nested"],
+        )
+        .expect("resolve exact local archives");
+        assert_eq!(paths, [root.join("streets.pmtiles")]);
+
+        let default_spec = root_url.to_string();
+        let paths = local_tileset_archive_paths(&default_spec, ["demo/streets"])
+            .expect("resolve nested default archive");
+        assert_eq!(paths, [root.join("demo/streets.pmtiles")]);
+        std::fs::remove_dir_all(root).expect("remove local source root");
     }
 
     #[test]
@@ -649,6 +769,52 @@ mod tests {
         let duration = metrics.histogram_snapshot().backend_fetch_duration_seconds;
         assert_eq!(duration.count, 1);
         assert!((duration.sum - 0.1).abs() < 1e-9, "sum={}", duration.sum);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backend_timeout_includes_artificial_latency_and_releases_permit() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "ishikari-fetcher-timeout-{}-{suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("fixture.pmtiles"), b"abcdefgh").unwrap();
+
+        let metrics = NodeMetrics::new();
+        let fetcher = ChunkFetcher::new(
+            directory.to_string_lossy().into_owned(),
+            4,
+            1,
+            BackendLatencyModel::fixed(
+                u64::try_from((BACKEND_FETCH_TIMEOUT + Duration::from_secs(1)).as_millis())
+                    .unwrap(),
+            ),
+            &ObjectStoreRegistry::new(),
+            metrics.clone(),
+        )
+        .unwrap();
+        let task = tokio::spawn(async move {
+            fetcher
+                .fetch_chunk_group(&TilesetId::try_new("fixture").unwrap(), 0..1, 8)
+                .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(BACKEND_FETCH_TIMEOUT).await;
+        tokio::task::yield_now().await;
+
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(ChunkFetchError::Timeout(_))
+        ));
+        let encoded = metrics.encode();
+        assert!(encoded.contains("ishikari_backend_fetch_concurrency{state=\"active\"} 0"));
+        assert!(encoded.contains("ishikari_backend_fetch_concurrency{state=\"waiting\"} 0"));
 
         std::fs::remove_dir_all(directory).unwrap();
     }

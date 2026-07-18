@@ -2,7 +2,7 @@
 
 use std::{collections::HashMap, ops::RangeInclusive, time::Duration};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use bytes::{Bytes, BytesMut};
 
 use crate::interned::TilesetId;
@@ -14,6 +14,74 @@ use super::{
     coordinator::ChunkFetchCoordinator,
     fetcher::{BackendLatencyModel, ChunkFetchError, ChunkFetcher},
 };
+
+const MAX_BACKEND_FETCH_CONCURRENCY: usize = 1_024;
+const MAX_CHUNK_SIZE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_FETCH_CHUNKS: u64 = 64;
+const MAX_BACKEND_FETCH_BYTES: u64 = 64 * 1024 * 1024;
+// Bound the worst-case bytes represented by all active range fetches without
+// rejecting the largest geometry used by the simulator's documented sweep
+// matrix (64 MiB per fetch at the default concurrency of 32).
+const MAX_BACKEND_ACTIVE_FETCH_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// A batching delay is useful in the low-millisecond range. Keep it well below
+/// the 30-second request deadline so every admitted request can be dispatched.
+const MAX_CHUNK_FETCH_MERGE_WINDOW: Duration = Duration::from_secs(1);
+
+/// Validates every value that controls chunk-range allocation, scheduling, or
+/// semaphore construction. Kept beside `ChunkedStore::new` so production,
+/// simulator, and future callers cannot diverge on safety invariants.
+#[doc(hidden)]
+pub fn validate_chunked_store_limits(
+    chunk_size: u64,
+    max_fetch_chunks: u64,
+    merge_window: Duration,
+    backend_fetch_concurrency: usize,
+) -> Result<()> {
+    if chunk_size == 0 {
+        bail!("chunk size bytes must be greater than zero");
+    }
+    if chunk_size > MAX_CHUNK_SIZE_BYTES {
+        bail!("chunk size bytes {chunk_size} exceeds the safe maximum {MAX_CHUNK_SIZE_BYTES}");
+    }
+    if max_fetch_chunks == 0 {
+        bail!("max fetch chunks must be greater than zero");
+    }
+    if max_fetch_chunks > MAX_FETCH_CHUNKS {
+        bail!("max fetch chunks {max_fetch_chunks} exceeds the safe maximum {MAX_FETCH_CHUNKS}");
+    }
+    let fetch_bytes = chunk_size
+        .checked_mul(max_fetch_chunks)
+        .context("backend fetch span overflows u64")?;
+    if fetch_bytes > MAX_BACKEND_FETCH_BYTES {
+        bail!(
+            "backend fetch span {fetch_bytes} bytes exceeds the safe maximum {MAX_BACKEND_FETCH_BYTES}"
+        );
+    }
+    if merge_window > MAX_CHUNK_FETCH_MERGE_WINDOW {
+        bail!(
+            "chunk fetch merge window {}ms exceeds the safe maximum {}ms",
+            merge_window.as_millis(),
+            MAX_CHUNK_FETCH_MERGE_WINDOW.as_millis()
+        );
+    }
+    if backend_fetch_concurrency == 0 {
+        bail!("backend fetch concurrency must be greater than zero");
+    }
+    if backend_fetch_concurrency > MAX_BACKEND_FETCH_CONCURRENCY {
+        bail!(
+            "backend fetch concurrency {backend_fetch_concurrency} exceeds the safe maximum {MAX_BACKEND_FETCH_CONCURRENCY}"
+        );
+    }
+    let active_fetch_bytes = fetch_bytes
+        .checked_mul(backend_fetch_concurrency as u64)
+        .context("active backend fetch byte budget overflows u64")?;
+    if active_fetch_bytes > MAX_BACKEND_ACTIVE_FETCH_BYTES {
+        bail!(
+            "active backend fetch budget {active_fetch_bytes} bytes exceeds the safe maximum {MAX_BACKEND_ACTIVE_FETCH_BYTES}"
+        );
+    }
+    Ok(())
+}
 
 /// Chunked byte-range reader backed by an object store.
 #[derive(Clone)]
@@ -52,20 +120,32 @@ impl ChunkedStore {
         registry: &ObjectStoreRegistry,
         metrics: NodeMetrics,
     ) -> Result<Self> {
+        validate_chunked_store_limits(
+            config.chunk_size,
+            config.max_fetch_chunks,
+            config.chunk_fetch_merge_window,
+            config.backend_fetch_concurrency,
+        )?;
+        let backend_fetch_concurrency = config.backend_fetch_concurrency;
         let fetcher = ChunkFetcher::new(
             config.tileset_sources,
             config.chunk_size,
-            config.backend_fetch_concurrency,
+            backend_fetch_concurrency,
             config.backend_latency,
             registry,
             metrics.clone(),
         )?;
+        // Admit far more requests than can execute at once so genuine bursts
+        // coalesce, but keep admitted work (coordinator state, waiters, detached
+        // tasks) bounded well below "one per distinct cold tileset".
+        let max_admitted_fetches = backend_fetch_concurrency.saturating_mul(64);
         Ok(Self {
             cache: ChunkCache::new(config.chunk_cache_max_bytes),
             coordinator: ChunkFetchCoordinator::new(
                 fetcher,
                 config.max_fetch_chunks,
                 config.chunk_fetch_merge_window,
+                max_admitted_fetches,
                 metrics,
             ),
         })

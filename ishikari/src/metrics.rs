@@ -13,18 +13,37 @@ use prometheus::{
     IntGaugeVec, Opts, Registry, TextEncoder, core::Collector,
 };
 
+const BACKEND_OUTCOMES: &[&str] = &["success", "not_found", "error", "timeout"];
+
 /// Cloneable handle to the node's Prometheus registry and metric families.
 #[derive(Clone)]
 pub struct NodeMetrics(Arc<Inner>);
 
-struct Inner {
-    registry: Registry,
+macro_rules! define_metrics_inner {
+    ($($field:ident: $metric:ty),+ $(,)?) => {
+        struct Inner {
+            registry: Registry,
+            $($field: $metric,)+
+        }
+
+        impl Inner {
+            fn register_collectors(&self) {
+                $(self.registry
+                    .register(Box::new(self.$field.clone()))
+                    .expect("unique metric");)+
+            }
+        }
+    };
+}
+
+define_metrics_inner!(
     egress_bytes: IntCounter,
     internal_bytes: IntCounter,
     http_requests: IntCounterVec,
     http_request_duration: HistogramVec,
     tiles_served: IntCounterVec,
     tile_cache: IntCounterVec,
+    tile_negative_cache_hits: IntCounter,
     peer_forward: IntCounterVec,
     peer_fetch: IntCounterVec,
     peer_fetch_duplicate_inflight: IntCounterVec,
@@ -55,45 +74,61 @@ struct Inner {
     terrain_output_size_bytes: HistogramVec,
     membership_size: IntGaugeVec,
     drain_state: IntGauge,
+);
+
+macro_rules! define_node_metrics_snapshot {
+    ($($field:ident),+ $(,)?) => {
+        /// Point-in-time counters used by tests and the in-process simulator.
+        #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, serde::Serialize)]
+        pub struct NodeMetricsSnapshot {
+            $(pub $field: u64,)+
+        }
+
+        impl NodeMetricsSnapshot {
+            /// Adds another point-in-time snapshot to this aggregate.
+            pub fn merge(&mut self, other: &Self) {
+                $(self.$field += other.$field;)+
+            }
+        }
+    };
 }
 
-/// Point-in-time counters used by tests and the in-process simulator.
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, serde::Serialize)]
-pub struct NodeMetricsSnapshot {
-    pub peer_forward_successes: u64,
-    pub peer_forward_not_found: u64,
-    pub peer_forward_retryable: u64,
-    pub peer_forward_fatal: u64,
-    pub peer_forward_backoff_skips: u64,
-    pub peer_tile_fetches: u64,
-    pub peer_bootstrap_fetches: u64,
-    pub peer_leaf_fetches: u64,
-    pub peer_provider_fetches: u64,
-    pub peer_tile_duplicate_inflight: u64,
-    pub peer_bootstrap_duplicate_inflight: u64,
-    pub peer_leaf_duplicate_inflight: u64,
-    pub peer_provider_duplicate_inflight: u64,
-    pub internal_tile_requests: u64,
-    pub internal_bootstrap_requests: u64,
-    pub internal_leaf_requests: u64,
-    pub internal_provider_requests: u64,
-    pub backend_fetches: u64,
-    pub backend_fetch_successes: u64,
-    pub backend_fetch_not_found: u64,
-    pub backend_fetch_errors: u64,
-    pub backend_fetch_timeouts: u64,
-    pub backend_fetched_chunks: u64,
-    pub chunk_cache_hits: u64,
-    pub chunk_cache_misses: u64,
-    pub chunk_cache_post_fetch_hits: u64,
-    pub chunk_fetch_queued: u64,
-    pub chunk_fetch_joined_pending: u64,
-    pub chunk_fetch_joined_inflight: u64,
-    pub chunk_dispatch_immediate: u64,
-    pub chunk_dispatch_window: u64,
-    pub chunk_dispatch_pending_chunks: u64,
-    pub chunk_waiters_released: u64,
-}
+define_node_metrics_snapshot!(
+    negative_cache_hits,
+    peer_forward_successes,
+    peer_forward_not_found,
+    peer_forward_retryable,
+    peer_forward_fatal,
+    peer_forward_backoff_skips,
+    peer_tile_fetches,
+    peer_bootstrap_fetches,
+    peer_leaf_fetches,
+    peer_provider_fetches,
+    peer_tile_duplicate_inflight,
+    peer_bootstrap_duplicate_inflight,
+    peer_leaf_duplicate_inflight,
+    peer_provider_duplicate_inflight,
+    internal_tile_requests,
+    internal_bootstrap_requests,
+    internal_leaf_requests,
+    internal_provider_requests,
+    backend_fetches,
+    backend_fetch_successes,
+    backend_fetch_not_found,
+    backend_fetch_errors,
+    backend_fetch_timeouts,
+    backend_fetched_chunks,
+    chunk_cache_hits,
+    chunk_cache_misses,
+    chunk_cache_post_fetch_hits,
+    chunk_fetch_queued,
+    chunk_fetch_joined_pending,
+    chunk_fetch_joined_inflight,
+    chunk_dispatch_immediate,
+    chunk_dispatch_window,
+    chunk_dispatch_pending_chunks,
+    chunk_waiters_released,
+);
 
 /// One Prometheus histogram captured as mergeable cumulative buckets.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
@@ -161,130 +196,123 @@ impl NodeHistogramSnapshot {
     }
 }
 
+fn int_counter(name: &str, help: &str) -> IntCounter {
+    IntCounter::new(name, help).expect("valid metric")
+}
+
+fn int_counter_vec(name: &str, help: &str, labels: &[&str]) -> IntCounterVec {
+    IntCounterVec::new(Opts::new(name, help), labels).expect("valid metric")
+}
+
+fn int_gauge(name: &str, help: &str) -> IntGauge {
+    IntGauge::new(name, help).expect("valid metric")
+}
+
+fn int_gauge_vec(name: &str, help: &str, labels: &[&str]) -> IntGaugeVec {
+    IntGaugeVec::new(Opts::new(name, help), labels).expect("valid metric")
+}
+
+fn gauge(name: &str, help: &str) -> Gauge {
+    Gauge::new(name, help).expect("valid metric")
+}
+
+fn histogram(name: &str, help: &str, buckets: Vec<f64>) -> Histogram {
+    Histogram::with_opts(HistogramOpts::new(name, help).buckets(buckets)).expect("valid metric")
+}
+
+fn histogram_vec(name: &str, help: &str, buckets: Vec<f64>, labels: &[&str]) -> HistogramVec {
+    HistogramVec::new(HistogramOpts::new(name, help).buckets(buckets), labels)
+        .expect("valid metric")
+}
+
 impl NodeMetrics {
     pub fn new() -> Self {
         let registry = Registry::new();
 
-        let egress_bytes = IntCounter::new(
+        let egress_bytes = int_counter(
             "ishikari_external_egress_bytes_total",
             "Bytes served to external clients",
-        )
-        .expect("valid metric");
-        let internal_bytes = IntCounter::new(
+        );
+        let internal_bytes = int_counter(
             "ishikari_internal_egress_bytes_total",
             "Bytes served to peers over internal endpoints",
-        )
-        .expect("valid metric");
-        let http_requests = IntCounterVec::new(
-            Opts::new(
-                "ishikari_http_requests_total",
-                "HTTP requests by route and status",
-            ),
+        );
+        let http_requests = int_counter_vec(
+            "ishikari_http_requests_total",
+            "HTTP requests by route and status",
             &["endpoint", "status"],
-        )
-        .expect("valid metric");
-        let http_request_duration = HistogramVec::new(
-            HistogramOpts::new(
-                "ishikari_http_request_duration_seconds",
-                "End-to-end HTTP request duration by route and status class",
-            )
-            .buckets(vec![
+        );
+        let http_request_duration = histogram_vec(
+            "ishikari_http_request_duration_seconds",
+            "End-to-end HTTP request duration by route and status class",
+            vec![
                 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
-            ]),
+            ],
             &["endpoint", "status_class"],
-        )
-        .expect("valid metric");
-        let tiles_served = IntCounterVec::new(
-            Opts::new(
-                "ishikari_tiles_served_total",
-                "External tile responses by where they were served from",
-            ),
+        );
+        let tiles_served = int_counter_vec(
+            "ishikari_tiles_served_total",
+            "External tile responses by where they were served from",
             &["source"],
-        )
-        .expect("valid metric");
-        let tile_cache = IntCounterVec::new(
-            Opts::new(
-                "ishikari_tile_cache_total",
-                "Tile cache lookups and inserts by outcome",
-            ),
+        );
+        let tile_cache = int_counter_vec(
+            "ishikari_tile_cache_total",
+            "Tile cache lookups and inserts by outcome",
             &["outcome"],
-        )
-        .expect("valid metric");
-        let peer_forward = IntCounterVec::new(
-            Opts::new(
-                "ishikari_peer_forward_total",
-                "Peer forwarding attempts and backoff skips by outcome",
-            ),
+        );
+        let tile_negative_cache_hits = int_counter(
+            "ishikari_tile_negative_cache_hits_total",
+            "Tile resolutions served by an existing negative L1 cache entry",
+        );
+        let peer_forward = int_counter_vec(
+            "ishikari_peer_forward_total",
+            "Peer forwarding attempts and backoff skips by outcome",
             &["outcome"],
-        )
-        .expect("valid metric");
-        let peer_fetch = IntCounterVec::new(
-            Opts::new(
-                "ishikari_peer_fetch_total",
-                "Internal peer fetch attempts by resource and outcome",
-            ),
+        );
+        let peer_fetch = int_counter_vec(
+            "ishikari_peer_fetch_total",
+            "Internal peer fetch attempts by resource and outcome",
             &["resource", "outcome"],
-        )
-        .expect("valid metric");
-        let peer_fetch_duplicate_inflight = IntCounterVec::new(
-            Opts::new(
-                "ishikari_peer_fetch_duplicate_inflight_total",
-                "Peer fetches overlapping an identical in-flight peer/path request",
-            ),
+        );
+        let peer_fetch_duplicate_inflight = int_counter_vec(
+            "ishikari_peer_fetch_duplicate_inflight_total",
+            "Peer fetches overlapping an identical in-flight peer/path request",
             &["resource"],
-        )
-        .expect("valid metric");
-        let internal_resource_requests = IntCounterVec::new(
-            Opts::new(
-                "ishikari_internal_resource_requests_total",
-                "Internal resource requests served by resource and outcome",
-            ),
+        );
+        let internal_resource_requests = int_counter_vec(
+            "ishikari_internal_resource_requests_total",
+            "Internal resource requests served by resource and outcome",
             &["resource", "outcome"],
-        )
-        .expect("valid metric");
-        let provider_resource_cache = IntCounterVec::new(
-            Opts::new(
-                "ishikari_provider_resource_cache_total",
-                "Provider resource cache activity by resource and outcome",
-            ),
+        );
+        let provider_resource_cache = int_counter_vec(
+            "ishikari_provider_resource_cache_total",
+            "Provider resource cache activity by resource and outcome",
             &["resource", "outcome"],
-        )
-        .expect("valid metric");
-        let mapterhorn_resolve = IntCounterVec::new(
-            Opts::new(
-                "ishikari_mapterhorn_resolve_total",
-                "Mapterhorn composite tile resolutions by outcome",
-            ),
+        );
+        let mapterhorn_resolve = int_counter_vec(
+            "ishikari_mapterhorn_resolve_total",
+            "Mapterhorn composite tile resolutions by outcome",
             &["outcome"],
-        )
-        .expect("valid metric");
-        let cache_bytes = IntGaugeVec::new(
-            Opts::new("ishikari_cache_bytes", "Weighted byte size of each cache"),
+        );
+        let cache_bytes = int_gauge_vec(
+            "ishikari_cache_bytes",
+            "Weighted byte size of each cache",
             &["cache"],
-        )
-        .expect("valid metric");
-        let backend_fetch_bytes = IntCounter::new(
+        );
+        let backend_fetch_bytes = int_counter(
             "ishikari_backend_fetch_bytes_total",
             "Cumulative bytes fetched from object storage / upstream",
-        )
-        .expect("valid metric");
-        let backend_fetch_duration = HistogramVec::new(
-            HistogramOpts::new(
-                "ishikari_backend_fetch_duration_seconds",
-                "Duration of object-storage chunk group fetches by outcome",
-            )
-            .buckets(vec![
-                0.005, 0.01, 0.025, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0,
-            ]),
+        );
+        let backend_fetch_duration = histogram_vec(
+            "ishikari_backend_fetch_duration_seconds",
+            "Duration of object-storage chunk group fetches by outcome",
+            vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0],
             &["outcome"],
-        )
-        .expect("valid metric");
-        let backend_fetch_size_bytes = HistogramVec::new(
-            HistogramOpts::new(
-                "ishikari_backend_fetch_size_bytes",
-                "Byte size of object-storage chunk group fetches by outcome",
-            )
-            .buckets(vec![
+        );
+        let backend_fetch_size_bytes = histogram_vec(
+            "ishikari_backend_fetch_size_bytes",
+            "Byte size of object-storage chunk group fetches by outcome",
+            vec![
                 16_384.0,
                 65_536.0,
                 262_144.0,
@@ -294,159 +322,111 @@ impl NodeMetrics {
                 8_388_608.0,
                 16_777_216.0,
                 33_554_432.0,
-            ]),
+            ],
             &["outcome"],
-        )
-        .expect("valid metric");
-        let backend_fetch_chunks = HistogramVec::new(
-            HistogramOpts::new(
-                "ishikari_backend_fetch_chunks",
-                "Number of fixed-size chunks covered by each object-storage fetch by outcome",
-            )
-            .buckets(vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0]),
+        );
+        let backend_fetch_chunks = histogram_vec(
+            "ishikari_backend_fetch_chunks",
+            "Number of fixed-size chunks covered by each object-storage fetch by outcome",
+            vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0],
             &["outcome"],
-        )
-        .expect("valid metric");
-        let backend_fetch_queue_duration = Histogram::with_opts(
-            HistogramOpts::new(
-                "ishikari_backend_fetch_queue_duration_seconds",
-                "Time an object-storage range fetch waits for the process-wide concurrency limit",
-            )
-            .buckets(vec![
+        );
+        let backend_fetch_queue_duration = histogram(
+            "ishikari_backend_fetch_queue_duration_seconds",
+            "Time an object-storage range fetch waits for the process-wide concurrency limit",
+            vec![
                 0.0001, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
-            ]),
-        )
-        .expect("valid metric");
-        let backend_fetch_concurrency = IntGaugeVec::new(
-            Opts::new(
-                "ishikari_backend_fetch_concurrency",
-                "Process-wide object-storage range-fetch admission state",
-            ),
+            ],
+        );
+        let backend_fetch_concurrency = int_gauge_vec(
+            "ishikari_backend_fetch_concurrency",
+            "Process-wide object-storage range-fetch admission state",
             &["state"],
-        )
-        .expect("valid metric");
-        let chunk_size_bytes = IntGauge::new(
+        );
+        let chunk_size_bytes = int_gauge(
             "ishikari_chunk_size_bytes",
             "Configured backend chunk size in bytes",
-        )
-        .expect("valid metric");
-        let max_fetch_chunks = IntGauge::new(
+        );
+        let max_fetch_chunks = int_gauge(
             "ishikari_max_fetch_chunks",
             "Configured maximum chunks to fetch in one backend request",
-        )
-        .expect("valid metric");
-        let chunk_fetch_merge_window_seconds = Gauge::new(
+        );
+        let chunk_fetch_merge_window_seconds = gauge(
             "ishikari_chunk_fetch_merge_window_seconds",
             "Configured scheduler delay used to merge nearby chunk fetch requests",
-        )
-        .expect("valid metric");
-        let chunk_fetch_queue_delay = HistogramVec::new(
-            HistogramOpts::new(
-                "ishikari_chunk_fetch_queue_delay_seconds",
-                "Time from the first queued missing chunk to backend fetch dispatch",
-            )
-            .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]),
+        );
+        let chunk_fetch_queue_delay = histogram_vec(
+            "ishikari_chunk_fetch_queue_delay_seconds",
+            "Time from the first queued missing chunk to backend fetch dispatch",
+            vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0],
             &["flush"],
-        )
-        .expect("valid metric");
-        let chunk_fetch_pending_chunks = HistogramVec::new(
-            HistogramOpts::new(
-                "ishikari_chunk_fetch_pending_chunks",
-                "Number of pending chunks visible when the scheduler dispatches backend fetches",
-            )
-            .buckets(vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0]),
+        );
+        let chunk_fetch_pending_chunks = histogram_vec(
+            "ishikari_chunk_fetch_pending_chunks",
+            "Number of pending chunks visible when the scheduler dispatches backend fetches",
+            vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0],
             &["flush"],
-        )
-        .expect("valid metric");
-        let chunk_fetch_group_waiters = HistogramVec::new(
-            HistogramOpts::new(
-                "ishikari_chunk_fetch_group_waiters",
-                "Number of chunk waiters released by each completed backend fetch group",
-            )
-            .buckets(vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0]),
+        );
+        let chunk_fetch_group_waiters = histogram_vec(
+            "ishikari_chunk_fetch_group_waiters",
+            "Number of chunk waiters released by each completed backend fetch group",
+            vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0],
             &["outcome"],
-        )
-        .expect("valid metric");
-        let chunk_cache = IntCounterVec::new(
-            Opts::new(
-                "ishikari_chunk_cache_total",
-                "Chunk cache lookups and post-fetch reads by outcome",
-            ),
+        );
+        let chunk_cache = int_counter_vec(
+            "ishikari_chunk_cache_total",
+            "Chunk cache lookups and post-fetch reads by outcome",
             &["outcome"],
-        )
-        .expect("valid metric");
-        let chunk_fetch_wait = IntCounterVec::new(
-            Opts::new(
-                "ishikari_chunk_fetch_wait_total",
-                "Chunk wait registrations by whether they queued a new fetch or joined existing work",
-            ),
+        );
+        let chunk_fetch_wait = int_counter_vec(
+            "ishikari_chunk_fetch_wait_total",
+            "Chunk wait registrations by whether they queued a new fetch or joined existing work",
             &["outcome"],
-        )
-        .expect("valid metric");
-        let cpu_work_admission = IntCounterVec::new(
-            Opts::new(
-                "ishikari_cpu_work_admission_total",
-                "CPU-heavy work admission attempts by work kind and outcome",
-            ),
+        );
+        let cpu_work_admission = int_counter_vec(
+            "ishikari_cpu_work_admission_total",
+            "CPU-heavy work admission attempts by work kind and outcome",
             &["work", "outcome"],
-        )
-        .expect("valid metric");
-        let cpu_work_queue_duration = HistogramVec::new(
-            HistogramOpts::new(
-                "ishikari_cpu_work_queue_duration_seconds",
-                "Time admitted CPU-heavy work waits for a blocking-work permit",
-            )
-            .buckets(vec![
+        );
+        let cpu_work_queue_duration = histogram_vec(
+            "ishikari_cpu_work_queue_duration_seconds",
+            "Time admitted CPU-heavy work waits for a blocking-work permit",
+            vec![
                 0.0001, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
-            ]),
+            ],
             &["work"],
-        )
-        .expect("valid metric");
-        let cpu_work = IntGaugeVec::new(
-            Opts::new(
-                "ishikari_cpu_work",
-                "Current and configured CPU-heavy work admission state",
-            ),
-            &["state"],
-        )
-        .expect("valid metric");
-        let terrain_source_duration = HistogramVec::new(
-            HistogramOpts::new(
-                "ishikari_terrain_source_duration_seconds",
-                "Time to fetch and decode a derived terrain product's DEM neighborhood",
-            )
-            .buckets(vec![
+        );
+        let cpu_work = int_gauge_vec(
+            "ishikari_cpu_work",
+            "CPU-heavy work admission and execution state by class (plus `all`)",
+            &["class", "state"],
+        );
+        let terrain_source_duration = histogram_vec(
+            "ishikari_terrain_source_duration_seconds",
+            "Time to fetch and decode a derived terrain product's DEM neighborhood",
+            vec![
                 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
-            ]),
+            ],
             &["product"],
-        )
-        .expect("valid metric");
-        let terrain_generation_duration = HistogramVec::new(
-            HistogramOpts::new(
-                "ishikari_terrain_generation_duration_seconds",
-                "CPU time to generate and compress a derived terrain product",
-            )
-            .buckets(vec![
+        );
+        let terrain_generation_duration = histogram_vec(
+            "ishikari_terrain_generation_duration_seconds",
+            "CPU time to generate and compress a derived terrain product",
+            vec![
                 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
-            ]),
+            ],
             &["product"],
-        )
-        .expect("valid metric");
-        let terrain_source_tiles = HistogramVec::new(
-            HistogramOpts::new(
-                "ishikari_terrain_source_tiles",
-                "Number of present DEM source tiles used by a derived terrain generation",
-            )
-            .buckets(vec![1.0, 4.0, 6.0, 8.0, 9.0]),
+        );
+        let terrain_source_tiles = histogram_vec(
+            "ishikari_terrain_source_tiles",
+            "Number of present DEM source tiles used by a derived terrain generation",
+            vec![1.0, 4.0, 6.0, 8.0, 9.0],
             &["product"],
-        )
-        .expect("valid metric");
-        let terrain_output_size_bytes = HistogramVec::new(
-            HistogramOpts::new(
-                "ishikari_terrain_output_size_bytes",
-                "Compressed byte size of generated terrain tile responses",
-            )
-            .buckets(vec![
+        );
+        let terrain_output_size_bytes = histogram_vec(
+            "ishikari_terrain_output_size_bytes",
+            "Compressed byte size of generated terrain tile responses",
+            vec![
                 4_096.0,
                 16_384.0,
                 65_536.0,
@@ -455,63 +435,20 @@ impl NodeMetrics {
                 524_288.0,
                 1_048_576.0,
                 2_097_152.0,
-            ]),
+            ],
             &["product"],
-        )
-        .expect("valid metric");
-        let membership_size = IntGaugeVec::new(
-            Opts::new("ishikari_membership_size", "Cluster member count by state"),
+        );
+        let membership_size = int_gauge_vec(
+            "ishikari_membership_size",
+            "Cluster member count by state",
             &["state"],
-        )
-        .expect("valid metric");
-        let drain_state = IntGauge::new(
+        );
+        let drain_state = int_gauge(
             "ishikari_drain_state",
             "1 if this node is draining, otherwise 0",
-        )
-        .expect("valid metric");
+        );
 
-        for collector in [
-            Box::new(egress_bytes.clone()) as Box<dyn prometheus::core::Collector>,
-            Box::new(internal_bytes.clone()),
-            Box::new(http_requests.clone()),
-            Box::new(http_request_duration.clone()),
-            Box::new(tiles_served.clone()),
-            Box::new(tile_cache.clone()),
-            Box::new(peer_forward.clone()),
-            Box::new(peer_fetch.clone()),
-            Box::new(peer_fetch_duplicate_inflight.clone()),
-            Box::new(internal_resource_requests.clone()),
-            Box::new(provider_resource_cache.clone()),
-            Box::new(mapterhorn_resolve.clone()),
-            Box::new(cache_bytes.clone()),
-            Box::new(backend_fetch_bytes.clone()),
-            Box::new(backend_fetch_duration.clone()),
-            Box::new(backend_fetch_size_bytes.clone()),
-            Box::new(backend_fetch_chunks.clone()),
-            Box::new(backend_fetch_queue_duration.clone()),
-            Box::new(backend_fetch_concurrency.clone()),
-            Box::new(chunk_size_bytes.clone()),
-            Box::new(max_fetch_chunks.clone()),
-            Box::new(chunk_fetch_merge_window_seconds.clone()),
-            Box::new(chunk_fetch_queue_delay.clone()),
-            Box::new(chunk_fetch_pending_chunks.clone()),
-            Box::new(chunk_fetch_group_waiters.clone()),
-            Box::new(chunk_cache.clone()),
-            Box::new(chunk_fetch_wait.clone()),
-            Box::new(cpu_work_admission.clone()),
-            Box::new(cpu_work_queue_duration.clone()),
-            Box::new(cpu_work.clone()),
-            Box::new(terrain_source_duration.clone()),
-            Box::new(terrain_generation_duration.clone()),
-            Box::new(terrain_source_tiles.clone()),
-            Box::new(terrain_output_size_bytes.clone()),
-            Box::new(membership_size.clone()),
-            Box::new(drain_state.clone()),
-        ] {
-            registry.register(collector).expect("unique metric");
-        }
-
-        Self(Arc::new(Inner {
+        let inner = Inner {
             registry,
             egress_bytes,
             internal_bytes,
@@ -519,6 +456,7 @@ impl NodeMetrics {
             http_request_duration,
             tiles_served,
             tile_cache,
+            tile_negative_cache_hits,
             peer_forward,
             peer_fetch,
             peer_fetch_duplicate_inflight,
@@ -549,7 +487,9 @@ impl NodeMetrics {
             terrain_output_size_bytes,
             membership_size,
             drain_state,
-        }))
+        };
+        inner.register_collectors();
+        Self(Arc::new(inner))
     }
 
     pub fn add_egress_bytes(&self, bytes: u64) {
@@ -596,8 +536,17 @@ impl NodeMetrics {
     }
 
     /// Records one tile-cache event.
+    ///
+    /// `negative_hit` is an internal exact event emitted only for
+    /// `TileSource::NegativeCache`. The existing aggregate `negative` outcome is
+    /// recorded separately so its historical hit-plus-insert semantics remain
+    /// compatible.
     pub fn record_tile_cache(&self, outcome: &str) {
-        self.0.tile_cache.with_label_values(&[outcome]).inc();
+        if outcome == "negative_hit" {
+            self.0.tile_negative_cache_hits.inc();
+        } else {
+            self.0.tile_cache.with_label_values(&[outcome]).inc();
+        }
     }
 
     /// Records one peer forwarding outcome or one routing skip due to backoff.
@@ -778,8 +727,15 @@ impl NodeMetrics {
             .observe(duration.as_secs_f64());
     }
 
-    /// Sets current and configured CPU-work admission values.
-    pub fn set_cpu_work(&self, inflight: usize, running: usize, concurrency: usize, max: usize) {
+    /// Sets aggregate current and configured CPU-work admission/execution values.
+    pub fn set_cpu_work(
+        &self,
+        class: &str,
+        inflight: usize,
+        running: usize,
+        concurrency: usize,
+        max: usize,
+    ) {
         for (state, value) in [
             ("inflight", inflight),
             ("running", running),
@@ -788,7 +744,7 @@ impl NodeMetrics {
         ] {
             self.0
                 .cpu_work
-                .with_label_values(&[state])
+                .with_label_values(&[class, state])
                 .set(value as i64);
         }
     }
@@ -822,90 +778,80 @@ impl NodeMetrics {
 
     /// Returns a structured snapshot without parsing Prometheus text output.
     pub fn snapshot(&self) -> NodeMetricsSnapshot {
-        let backend_count = |outcome: &str| {
-            self.0
-                .backend_fetch_duration
-                .with_label_values(&[outcome])
-                .get_sample_count()
-        };
-        let backend_fetch_successes = backend_count("success");
-        let backend_fetch_not_found = backend_count("not_found");
-        let backend_fetch_errors = backend_count("error");
-        let backend_fetch_timeouts = backend_count("timeout");
         let counter =
             |metric: &IntCounterVec, label: &str| metric.with_label_values(&[label]).get();
-        let dispatch_count = |flush: &str| {
-            self.0
-                .chunk_fetch_queue_delay
-                .with_label_values(&[flush])
-                .get_sample_count()
-        };
-        let peer_fetch_count = |resource: &str| {
-            ["success", "not_found", "retryable", "fatal"]
-                .into_iter()
-                .map(|outcome| {
-                    self.0
-                        .peer_fetch
-                        .with_label_values(&[resource, outcome])
-                        .get()
-                })
+        let labeled_counter_sum = |metric: &IntCounterVec, first: &str, second_values: &[&str]| {
+            second_values
+                .iter()
+                .map(|second| metric.with_label_values(&[first, *second]).get())
                 .sum()
         };
-        let internal_request_count = |resource: &str| {
-            ["success", "not_found", "retryable", "error"]
-                .into_iter()
-                .map(|outcome| {
-                    self.0
-                        .internal_resource_requests
-                        .with_label_values(&[resource, outcome])
-                        .get()
-                })
-                .sum()
+        let histogram_count = |metric: &HistogramVec, label: &str| {
+            metric.with_label_values(&[label]).get_sample_count()
         };
+        let histogram_sum = |metric: &HistogramVec, label: &str| {
+            metric.with_label_values(&[label]).get_sample_sum().round() as u64
+        };
+        let provider_resources = ["style", "glyph", "sprite", "derived", "other"];
+        let peer_outcomes = ["success", "not_found", "retryable", "fatal"];
+        let internal_outcomes = ["success", "not_found", "retryable", "error"];
+        let backend_fetch_successes = histogram_count(&self.0.backend_fetch_duration, "success");
+        let backend_fetch_not_found = histogram_count(&self.0.backend_fetch_duration, "not_found");
+        let backend_fetch_errors = histogram_count(&self.0.backend_fetch_duration, "error");
+        let backend_fetch_timeouts = histogram_count(&self.0.backend_fetch_duration, "timeout");
 
         NodeMetricsSnapshot {
+            negative_cache_hits: self.0.tile_negative_cache_hits.get(),
             peer_forward_successes: counter(&self.0.peer_forward, "success"),
             peer_forward_not_found: counter(&self.0.peer_forward, "not_found"),
             peer_forward_retryable: counter(&self.0.peer_forward, "retryable"),
             peer_forward_fatal: counter(&self.0.peer_forward, "fatal"),
             peer_forward_backoff_skips: counter(&self.0.peer_forward, "backoff"),
-            peer_tile_fetches: peer_fetch_count("tile"),
-            peer_bootstrap_fetches: peer_fetch_count("bootstrap"),
-            peer_leaf_fetches: peer_fetch_count("leaf"),
-            peer_provider_fetches: ["style", "glyph", "sprite", "derived", "other"]
+            peer_tile_fetches: labeled_counter_sum(&self.0.peer_fetch, "tile", &peer_outcomes),
+            peer_bootstrap_fetches: labeled_counter_sum(
+                &self.0.peer_fetch,
+                "bootstrap",
+                &peer_outcomes,
+            ),
+            peer_leaf_fetches: labeled_counter_sum(&self.0.peer_fetch, "leaf", &peer_outcomes),
+            peer_provider_fetches: provider_resources
                 .into_iter()
-                .map(peer_fetch_count)
+                .map(|resource| labeled_counter_sum(&self.0.peer_fetch, resource, &peer_outcomes))
                 .sum(),
-            peer_tile_duplicate_inflight: self
-                .0
-                .peer_fetch_duplicate_inflight
-                .with_label_values(&["tile"])
-                .get(),
-            peer_bootstrap_duplicate_inflight: self
-                .0
-                .peer_fetch_duplicate_inflight
-                .with_label_values(&["bootstrap"])
-                .get(),
-            peer_leaf_duplicate_inflight: self
-                .0
-                .peer_fetch_duplicate_inflight
-                .with_label_values(&["leaf"])
-                .get(),
-            peer_provider_duplicate_inflight: ["style", "glyph", "sprite", "derived", "other"]
+            peer_tile_duplicate_inflight: counter(&self.0.peer_fetch_duplicate_inflight, "tile"),
+            peer_bootstrap_duplicate_inflight: counter(
+                &self.0.peer_fetch_duplicate_inflight,
+                "bootstrap",
+            ),
+            peer_leaf_duplicate_inflight: counter(&self.0.peer_fetch_duplicate_inflight, "leaf"),
+            peer_provider_duplicate_inflight: provider_resources
+                .into_iter()
+                .map(|resource| counter(&self.0.peer_fetch_duplicate_inflight, resource))
+                .sum(),
+            internal_tile_requests: labeled_counter_sum(
+                &self.0.internal_resource_requests,
+                "tile",
+                &internal_outcomes,
+            ),
+            internal_bootstrap_requests: labeled_counter_sum(
+                &self.0.internal_resource_requests,
+                "bootstrap",
+                &internal_outcomes,
+            ),
+            internal_leaf_requests: labeled_counter_sum(
+                &self.0.internal_resource_requests,
+                "leaf",
+                &internal_outcomes,
+            ),
+            internal_provider_requests: provider_resources
                 .into_iter()
                 .map(|resource| {
-                    self.0
-                        .peer_fetch_duplicate_inflight
-                        .with_label_values(&[resource])
-                        .get()
+                    labeled_counter_sum(
+                        &self.0.internal_resource_requests,
+                        resource,
+                        &internal_outcomes,
+                    )
                 })
-                .sum(),
-            internal_tile_requests: internal_request_count("tile"),
-            internal_bootstrap_requests: internal_request_count("bootstrap"),
-            internal_leaf_requests: internal_request_count("leaf"),
-            internal_provider_requests: ["style", "glyph", "sprite", "derived", "other"]
-                .into_iter()
-                .map(internal_request_count)
                 .sum(),
             backend_fetches: backend_fetch_successes
                 + backend_fetch_not_found
@@ -915,85 +861,48 @@ impl NodeMetrics {
             backend_fetch_not_found,
             backend_fetch_errors,
             backend_fetch_timeouts,
-            backend_fetched_chunks: self
-                .0
-                .backend_fetch_chunks
-                .with_label_values(&["success"])
-                .get_sample_sum()
-                .round() as u64,
+            backend_fetched_chunks: histogram_sum(&self.0.backend_fetch_chunks, "success"),
             chunk_cache_hits: counter(&self.0.chunk_cache, "hit"),
             chunk_cache_misses: counter(&self.0.chunk_cache, "miss"),
             chunk_cache_post_fetch_hits: counter(&self.0.chunk_cache, "post_fetch_hit"),
             chunk_fetch_queued: counter(&self.0.chunk_fetch_wait, "queued"),
             chunk_fetch_joined_pending: counter(&self.0.chunk_fetch_wait, "joined_pending"),
             chunk_fetch_joined_inflight: counter(&self.0.chunk_fetch_wait, "joined_inflight"),
-            chunk_dispatch_immediate: dispatch_count("immediate"),
-            chunk_dispatch_window: dispatch_count("window"),
+            chunk_dispatch_immediate: histogram_count(&self.0.chunk_fetch_queue_delay, "immediate"),
+            chunk_dispatch_window: histogram_count(&self.0.chunk_fetch_queue_delay, "window"),
             chunk_dispatch_pending_chunks: ["immediate", "window"]
                 .into_iter()
-                .map(|flush| {
-                    self.0
-                        .chunk_fetch_pending_chunks
-                        .with_label_values(&[flush])
-                        .get_sample_sum()
-                        .round() as u64
-                })
+                .map(|flush| histogram_sum(&self.0.chunk_fetch_pending_chunks, flush))
                 .sum(),
             chunk_waiters_released: ["success", "error"]
                 .into_iter()
-                .map(|outcome| {
-                    self.0
-                        .chunk_fetch_group_waiters
-                        .with_label_values(&[outcome])
-                        .get_sample_sum()
-                        .round() as u64
-                })
+                .map(|outcome| histogram_sum(&self.0.chunk_fetch_group_waiters, outcome))
                 .sum(),
         }
     }
 
     /// Returns mergeable backend/scheduler histogram buckets.
     pub fn histogram_snapshot(&self) -> NodeHistogramSnapshot {
+        let labeled = |metric: &HistogramVec, label: &str| {
+            histogram_snapshot(&metric.with_label_values(&[label]))
+        };
         NodeHistogramSnapshot {
             backend_fetch_duration_seconds: merge_histograms(
                 &self.0.backend_fetch_duration,
-                &["success", "not_found", "error", "timeout"],
+                BACKEND_OUTCOMES,
             ),
             backend_fetch_queue_duration_seconds: histogram_snapshot(
                 &self.0.backend_fetch_queue_duration,
             ),
             backend_fetch_size_bytes: merge_histograms(
                 &self.0.backend_fetch_size_bytes,
-                &["success", "not_found", "error", "timeout"],
+                BACKEND_OUTCOMES,
             ),
-            backend_fetch_chunks: merge_histograms(
-                &self.0.backend_fetch_chunks,
-                &["success", "not_found", "error", "timeout"],
-            ),
-            queue_delay_immediate_seconds: histogram_snapshot(
-                &self
-                    .0
-                    .chunk_fetch_queue_delay
-                    .with_label_values(&["immediate"]),
-            ),
-            queue_delay_window_seconds: histogram_snapshot(
-                &self
-                    .0
-                    .chunk_fetch_queue_delay
-                    .with_label_values(&["window"]),
-            ),
-            pending_chunks_immediate: histogram_snapshot(
-                &self
-                    .0
-                    .chunk_fetch_pending_chunks
-                    .with_label_values(&["immediate"]),
-            ),
-            pending_chunks_window: histogram_snapshot(
-                &self
-                    .0
-                    .chunk_fetch_pending_chunks
-                    .with_label_values(&["window"]),
-            ),
+            backend_fetch_chunks: merge_histograms(&self.0.backend_fetch_chunks, BACKEND_OUTCOMES),
+            queue_delay_immediate_seconds: labeled(&self.0.chunk_fetch_queue_delay, "immediate"),
+            queue_delay_window_seconds: labeled(&self.0.chunk_fetch_queue_delay, "window"),
+            pending_chunks_immediate: labeled(&self.0.chunk_fetch_pending_chunks, "immediate"),
+            pending_chunks_window: labeled(&self.0.chunk_fetch_pending_chunks, "window"),
             group_waiters: merge_histograms(
                 &self.0.chunk_fetch_group_waiters,
                 &["success", "error"],
@@ -1077,5 +986,29 @@ fn histogram_snapshot(histogram: &Histogram) -> HistogramSnapshot {
 impl Default for NodeMetrics {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NodeMetrics;
+
+    #[test]
+    fn exact_negative_cache_hit_metric_is_distinct_from_legacy_negative_events() {
+        let metrics = NodeMetrics::new();
+        assert!(
+            metrics
+                .encode()
+                .contains("ishikari_tile_negative_cache_hits_total 0")
+        );
+
+        metrics.record_tile_cache("negative");
+        assert_eq!(metrics.snapshot().negative_cache_hits, 0);
+
+        metrics.record_tile_cache("negative_hit");
+        let encoded = metrics.encode();
+        assert_eq!(metrics.snapshot().negative_cache_hits, 1);
+        assert!(encoded.contains("ishikari_tile_negative_cache_hits_total 1"));
+        assert!(encoded.contains("ishikari_tile_cache_total{outcome=\"negative\"} 1"));
     }
 }

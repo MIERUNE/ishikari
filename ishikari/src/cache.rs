@@ -172,14 +172,32 @@ impl ResourceCache {
     }
 }
 
+/// Minimum weight charged for any tile-cache entry. `TileCacheKey`'s inline
+/// size excludes the heap bytes of its interned tileset id (up to 256 bytes),
+/// and every entry also pays moka's per-entry bookkeeping. Without a floor a
+/// flood of distinct negative (`NotFound`) lookups — enumerating unique valid
+/// tileset ids over the public path — would blow far past the byte capacity
+/// while the cache reports near-zero usage.
+pub const MIN_TILE_CACHE_ENTRY_WEIGHT: u32 = 128;
+
+/// Logical byte weight of a tile-cache entry: the inline key, the interned
+/// tileset id bytes, and the payload (`None` for a negative entry), floored at
+/// [`MIN_TILE_CACHE_ENTRY_WEIGHT`]. Shared with the modeled simulator so its
+/// capacity sweeps charge the same weights as production.
+pub fn tile_cache_logical_weight(tileset_id: &str, payload_len: Option<usize>) -> u32 {
+    let total = std::mem::size_of::<TileCacheKey>()
+        .saturating_add(tileset_id.len())
+        .saturating_add(payload_len.unwrap_or(0));
+    (total.min(u32::MAX as usize) as u32).max(MIN_TILE_CACHE_ENTRY_WEIGHT)
+}
+
 /// Estimates the weight of a cached tile entry.
 fn tile_cache_weight(key: &TileCacheKey, value: &CachedTile) -> u32 {
-    let value_size = match value {
-        CachedTile::Found { bytes, .. } => bytes.len(),
-        CachedTile::NotFound => 0,
+    let payload_len = match value {
+        CachedTile::Found { bytes, .. } => Some(bytes.len()),
+        CachedTile::NotFound => None,
     };
-    let total = std::mem::size_of_val(key).saturating_add(value_size);
-    total.min(u32::MAX as usize) as u32
+    tile_cache_logical_weight(key.tileset_id.as_str(), payload_len)
 }
 
 /// Estimates the weight of a cached resource entry.
@@ -215,6 +233,68 @@ mod tests {
             Some(Duration::from_secs(60))
         );
         assert_eq!(expiry.ttl_for(&found()), None);
+    }
+
+    #[test]
+    fn logical_weight_helper_is_the_shared_production_contract() {
+        // The modeled simulator calls this same helper, so its capacity sweeps
+        // charge production weights. A negative entry is floored; identifier
+        // bytes and payload add on top.
+        assert_eq!(
+            tile_cache_logical_weight("demo/streets", None),
+            MIN_TILE_CACHE_ENTRY_WEIGHT
+        );
+        let big_payload = tile_cache_logical_weight("demo/streets", Some(64 * 1024));
+        assert!(big_payload > MIN_TILE_CACHE_ENTRY_WEIGHT);
+        assert!(
+            tile_cache_logical_weight(&"a".repeat(256), None)
+                > tile_cache_logical_weight("a", None)
+        );
+        // The struct weigher agrees with the helper for both variants.
+        let key = TileCacheKey::new(&TilesetId::new_unchecked("demo/streets"), 1);
+        assert_eq!(
+            tile_cache_weight(&key, &CachedTile::NotFound),
+            tile_cache_logical_weight("demo/streets", None)
+        );
+    }
+
+    #[test]
+    fn negative_entries_are_charged_a_floor_weight() {
+        let key = TileCacheKey::new(&TilesetId::new_unchecked("demo/streets"), 7);
+        // A NotFound carries no bytes but still costs key + interned id + moka
+        // bookkeeping, so it must be charged at least the floor.
+        assert_eq!(
+            tile_cache_weight(&key, &CachedTile::NotFound),
+            MIN_TILE_CACHE_ENTRY_WEIGHT
+        );
+        // A long tileset id pushes the weight above the floor via its bytes.
+        let long = "a".repeat(256);
+        let long_key = TileCacheKey::new(&TilesetId::new_unchecked(&long), 7);
+        assert!(tile_cache_weight(&long_key, &CachedTile::NotFound) > MIN_TILE_CACHE_ENTRY_WEIGHT);
+    }
+
+    #[test]
+    fn negative_entries_are_evicted_under_a_tight_byte_budget() {
+        // 100 negative entries at a 128-byte floor need ~12.8 KiB; a 4 KiB cap
+        // must therefore evict rather than retain them all — which a weight of 0
+        // (the previous behavior) would wrongly allow.
+        let cache = TileCache::new(4 * 1024, Duration::from_secs(60));
+        let tileset = TilesetId::new_unchecked("demo/streets");
+        for tile_id in 0..100 {
+            cache.put(TileCacheKey::new(&tileset, tile_id), CachedTile::NotFound);
+        }
+        assert!(
+            cache.weighted_size() <= 4 * 1024,
+            "weighted size {} exceeds the byte budget",
+            cache.weighted_size()
+        );
+        let retained = (0..100)
+            .filter(|&tile_id| cache.get(&TileCacheKey::new(&tileset, tile_id)).is_some())
+            .count();
+        assert!(
+            retained < 100,
+            "expected eviction, retained {retained} entries"
+        );
     }
 
     #[test]

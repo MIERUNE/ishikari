@@ -62,6 +62,11 @@ pub(crate) fn mvt_to_mlt(mvt: &[u8]) -> Result<Vec<u8>> {
 
 /// Largest unsigned integer exactly representable as an `f64` (`Number.MAX_SAFE_INTEGER + 1`).
 const JS_SAFE_INT: u64 = 1 << 53;
+/// Maximum decompressed MVT accepted for transcoding. A single vector tile is
+/// normally well under a megabyte; this bounds gzip expansion so a compromised
+/// peer cannot return a tiny high-ratio payload that inflates to gigabytes and
+/// OOMs the node on one `.mlt` request. Comfortably above any legitimate tile.
+const MAX_DECOMPRESSED_MVT_BYTES: usize = 16 * 1024 * 1024;
 
 /// Whether any property column in the layer is a 64-bit integer (so would
 /// decode to a `BigInt` in the browser).
@@ -245,7 +250,7 @@ async fn transcoded_mlt(
             // MLT encoding (FSST/FastPFOR plus gzip) is CPU-heavy. Keep it off
             // Tokio workers and under the shared CPU-work admission limit (which
             // sheds with 503 under extreme overload).
-            let permit = state.admit_cpu_work("mlt_transcode").await?;
+            let permit = state.admit_transcode_work().await?;
             tokio::task::spawn_blocking(move || {
                 // A dropped request cannot cancel blocking work. Keep the permit
                 // in this closure so abandoned work remains within the limit.
@@ -264,11 +269,25 @@ async fn transcoded_mlt(
         .map_err(|error: std::sync::Arc<HttpError>| (*error).clone())
 }
 
-fn transcode_mlt(tile: TileData) -> Result<Bytes, HttpError> {
+pub(crate) fn transcode_mlt(tile: TileData) -> Result<Bytes, HttpError> {
     // `mlt-core` needs the decompressed MVT; PMTiles stores tiles gzip-encoded.
     let raw_mvt = match tile.content_encoding {
-        Some("gzip") => gunzip(&tile.bytes)?,
-        _ => tile.bytes.to_vec(),
+        Some("gzip") => gunzip(&tile.bytes, MAX_DECOMPRESSED_MVT_BYTES)?,
+        None => {
+            if tile.bytes.len() > MAX_DECOMPRESSED_MVT_BYTES {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    "MVT tile too large to transcode".to_string(),
+                ));
+            }
+            tile.bytes.to_vec()
+        }
+        Some(encoding) => {
+            return Err((
+                StatusCode::NOT_ACCEPTABLE,
+                format!("cannot transcode {encoding}-encoded tile to MLT"),
+            ));
+        }
     };
     let mlt = mvt_to_mlt(&raw_mvt).map_err(|error| {
         (
@@ -279,9 +298,12 @@ fn transcode_mlt(tile: TileData) -> Result<Bytes, HttpError> {
     Ok(Bytes::from(gzip(&mlt)?))
 }
 
-fn gunzip(data: &[u8]) -> Result<Vec<u8>, HttpError> {
+fn gunzip(data: &[u8], max_bytes: usize) -> Result<Vec<u8>, HttpError> {
+    // Read one byte past the limit so an over-budget stream is detected without
+    // materializing the whole expansion — the gzip-bomb guard.
     let mut out = Vec::new();
     GzDecoder::new(data)
+        .take(max_bytes.saturating_add(1) as u64)
         .read_to_end(&mut out)
         .map_err(|error| {
             (
@@ -289,6 +311,12 @@ fn gunzip(data: &[u8]) -> Result<Vec<u8>, HttpError> {
                 format!("gunzip: {error}"),
             )
         })?;
+    if out.len() > max_bytes {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "decompressed MVT exceeds the transcode budget".to_string(),
+        ));
+    }
     Ok(out)
 }
 
@@ -418,5 +446,14 @@ mod tests {
             content_encoding: Some("gzip"),
         };
         assert!(!is_mlt_tile(&mvt));
+    }
+
+    #[test]
+    fn gunzip_rejects_expansion_past_the_decompressed_budget() {
+        let compressed = gzip(&vec![0; 64 * 1024]).unwrap();
+        let error = gunzip(&compressed, 4 * 1024).unwrap_err();
+
+        assert_eq!(error.0, StatusCode::BAD_GATEWAY);
+        assert!(error.1.contains("exceeds the transcode budget"));
     }
 }

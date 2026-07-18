@@ -13,3 +13,4 @@ spec:
     - name: gossip
       port: 7946
       targetPort: gossip
+      protocol: UDP

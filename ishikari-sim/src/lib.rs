@@ -6,6 +6,7 @@ mod http_replay;
 mod latency;
 mod membership;
 mod modeled;
+mod output;
 mod report;
 mod sweep;
 mod timed;
@@ -23,9 +24,14 @@ pub use http_replay::{
 };
 pub use latency::{BackendLatencyConfig, BackendLatencyProfile};
 pub use modeled::{ModeledCluster, TileCatalog};
+#[doc(hidden)]
+pub use output::{
+    AtomicOutputFile, ensure_output_distinct, local_source_archives,
+    local_source_archives_for_tilesets, write_atomic,
+};
 pub use report::{ClusterObservation, SimReport};
 pub use sweep::run_sweep;
 pub use timed::{LatencySummary, TimedConfig, TimedReport, run_timed_trace};
-pub use trace::{read_trace, viewport_batch_ranges, write_trace_entry};
+pub use trace::{read_trace, read_trace_with_digest, viewport_batch_ranges, write_trace_entry};
 pub use visualization::{render_visualization, write_visualization};
 pub use workload::{EntryAffinity, PopulationCdf, TraceEntry, Workload, WorkloadConfig};

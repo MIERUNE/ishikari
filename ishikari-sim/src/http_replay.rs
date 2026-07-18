@@ -1,8 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     fs::File,
-    io::{BufReader, Read},
-    path::{Path, PathBuf},
+    io::BufReader,
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
@@ -11,16 +11,23 @@ use ishikari::{
     pmtiles::{TileCoord, TileId},
     storage::TilesetId,
 };
-use reqwest::{Client, StatusCode, Url, header};
+use reqwest::{Client, Response, StatusCode, Url, header};
 use serde::Serialize;
 use tokio::task::JoinSet;
 
-use crate::{TraceEntry, read_trace, viewport_batch_ranges};
+use crate::{
+    TraceEntry, read_trace_with_digest, report::calculate_derived_rates, trace::format_fnv1a64,
+    viewport_batch_ranges,
+};
 
-const HTTP_REPLAY_SCHEMA_VERSION: u32 = 1;
+const HTTP_REPLAY_SCHEMA_VERSION: u32 = 2;
 const MAX_FAILURE_SAMPLES: usize = 20;
-const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+const MAX_REPLAY_BODY_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_METRICS_BODY_BYTES: u64 = 8 * 1024 * 1024;
+const METRICS_SCRAPE_CONCURRENCY: u8 = 1;
+// `u64::MAX as f64` rounds up to this value. Use it as an exclusive bound so
+// the float-to-integer cast cannot silently saturate an out-of-range sample.
+const U64_UPPER_BOUND_EXCLUSIVE: f64 = 18_446_744_073_709_551_616.0;
 
 #[derive(Clone, Debug)]
 pub enum HttpReplayTarget {
@@ -79,6 +86,9 @@ struct HttpExecutionReport {
     redirects: bool,
     retries: u8,
     cache_control_no_cache: bool,
+    max_response_body_bytes: u64,
+    max_metrics_body_bytes: u64,
+    metrics_scrape_concurrency: u8,
 }
 
 #[derive(Debug, Serialize)]
@@ -155,6 +165,7 @@ struct ComparableMetrics {
     peer_bytes: u64,
     backend_bytes: u64,
     l1_cache_hits: u64,
+    negative_cache_hits: u64,
     l1_cache_hit_rate: f64,
     cache_hit_rate: f64,
     peer_forward_rate: f64,
@@ -186,7 +197,9 @@ impl ComparableMetrics {
                 )?,
             );
         }
-        result.requests = result.by_source.values().sum();
+        result.requests = result.by_source.values().try_fold(0_u64, |total, value| {
+            checked_metric_add(total, *value, "requests")
+        })?;
         result.not_found = result.by_source.get("miss").copied().unwrap_or_default();
         result.found = result.requests.saturating_sub(result.not_found);
         result.served_bytes =
@@ -201,6 +214,12 @@ impl ComparableMetrics {
             "ishikari_tile_cache_total",
             &[("outcome", "hit")],
         )?;
+        result.negative_cache_hits = required_counter_delta(
+            before,
+            after,
+            "ishikari_tile_negative_cache_hits_total",
+            &[],
+        )?;
         result.peer_requests =
             sum_counter_family_delta(before, after, "ishikari_peer_fetch_total")?;
 
@@ -211,7 +230,8 @@ impl ComparableMetrics {
                 "ishikari_backend_fetch_duration_seconds_count",
                 &[("outcome", outcome)],
             )?;
-            result.backend_fetches += count;
+            result.backend_fetches =
+                checked_metric_add(result.backend_fetches, count, "backend_fetches")?;
             result
                 .backend_fetch_outcomes
                 .insert(outcome.to_string(), count);
@@ -248,63 +268,85 @@ impl ComparableMetrics {
         Ok(result)
     }
 
-    fn add_assign(&mut self, other: &Self) {
-        self.requests += other.requests;
-        self.found += other.found;
-        self.not_found += other.not_found;
-        self.served_bytes += other.served_bytes;
-        self.peer_requests += other.peer_requests;
-        self.peer_bytes += other.peer_bytes;
-        self.backend_bytes += other.backend_bytes;
-        self.l1_cache_hits += other.l1_cache_hits;
-        self.backend_fetches += other.backend_fetches;
-        self.backend_fetched_chunks += other.backend_fetched_chunks;
-        add_map(&mut self.by_source, &other.by_source);
+    fn add_assign(&mut self, other: &Self) -> Result<()> {
+        macro_rules! add_fields {
+            ($($field:ident),+ $(,)?) => {
+                $(self.$field = checked_metric_add(
+                    self.$field,
+                    other.$field,
+                    stringify!($field),
+                )?;)+
+            };
+        }
+        add_fields!(
+            requests,
+            found,
+            not_found,
+            served_bytes,
+            peer_requests,
+            peer_bytes,
+            backend_bytes,
+            l1_cache_hits,
+            negative_cache_hits,
+            backend_fetches,
+            backend_fetched_chunks,
+        );
+        add_map("by_source", &mut self.by_source, &other.by_source)?;
         add_map(
+            "backend_fetch_outcomes",
             &mut self.backend_fetch_outcomes,
             &other.backend_fetch_outcomes,
-        );
-        add_map(&mut self.chunk_cache, &other.chunk_cache);
-        add_map(&mut self.chunk_fetch_wait, &other.chunk_fetch_wait);
+        )?;
+        add_map("chunk_cache", &mut self.chunk_cache, &other.chunk_cache)?;
+        add_map(
+            "chunk_fetch_wait",
+            &mut self.chunk_fetch_wait,
+            &other.chunk_fetch_wait,
+        )?;
+        Ok(())
     }
 
     fn finalize_rates(&mut self) {
-        if self.requests > 0 {
-            let self_cache = self
-                .by_source
-                .get("self_cache")
-                .copied()
-                .unwrap_or_default();
-            let peer_cache = self
-                .by_source
-                .get("peer_cache")
-                .copied()
-                .unwrap_or_default();
-            let peer_backend = self
-                .by_source
-                .get("peer_backend")
-                .copied()
-                .unwrap_or_default();
-            self.l1_cache_hit_rate = self.l1_cache_hits as f64 / self.requests as f64;
-            self.cache_hit_rate = (self_cache + peer_cache) as f64 / self.requests as f64;
-            self.peer_forward_rate = (peer_cache + peer_backend) as f64 / self.requests as f64;
+        let (request_rates, read_amplification) = calculate_derived_rates(
+            self.requests,
+            self.served_bytes,
+            self.backend_bytes,
+            self.l1_cache_hits,
+            &self.by_source,
+        );
+        if let Some((l1, cache, peer)) = request_rates {
+            self.l1_cache_hit_rate = l1;
+            self.cache_hit_rate = cache;
+            self.peer_forward_rate = peer;
         }
-        if self.served_bytes > 0 {
-            self.read_amplification = self.backend_bytes as f64 / self.served_bytes as f64;
+        if let Some(read_amplification) = read_amplification {
+            self.read_amplification = read_amplification;
         }
     }
 }
 
-fn add_map(target: &mut BTreeMap<String, u64>, other: &BTreeMap<String, u64>) {
+fn checked_metric_add(left: u64, right: u64, field: &str) -> Result<u64> {
+    left.checked_add(right)
+        .with_context(|| format!("Prometheus counter aggregate overflow for {field}"))
+}
+
+fn add_map(
+    family: &str,
+    target: &mut BTreeMap<String, u64>,
+    other: &BTreeMap<String, u64>,
+) -> Result<()> {
     for (key, value) in other {
-        *target.entry(key.clone()).or_default() += value;
+        let target_value = target.entry(key.clone()).or_default();
+        *target_value = checked_metric_add(*target_value, *value, &format!("{family}[{key}]"))?;
     }
+    Ok(())
 }
 
-#[derive(Clone)]
 struct PlannedHttpRequest {
     trace_index: usize,
-    entry: TraceEntry,
+    step: u64,
+    user: usize,
+    ordinal: usize,
     url: Url,
 }
 
@@ -315,6 +357,85 @@ struct HttpRequestOutcome {
     body_bytes: u64,
     error_category: Option<&'static str>,
     error_detail: Option<String>,
+}
+
+struct HttpOutcomeAccumulator {
+    attempted: usize,
+    responses: usize,
+    transport_errors: usize,
+    unexpected_statuses: usize,
+    status_counts: BTreeMap<u16, u64>,
+    response_body_bytes: u64,
+    latencies: Vec<Duration>,
+    failure_samples: Vec<HttpFailureSample>,
+}
+
+impl HttpOutcomeAccumulator {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            attempted: 0,
+            responses: 0,
+            transport_errors: 0,
+            unexpected_statuses: 0,
+            status_counts: BTreeMap::new(),
+            response_body_bytes: 0,
+            // Latencies are the only per-request replay result retained. Plans
+            // and outcomes are consumed one at a time (or one viewport batch at
+            // a time), avoiding two additional trace-sized allocations.
+            latencies: Vec::with_capacity(capacity),
+            failure_samples: Vec::new(),
+        }
+    }
+
+    fn record(&mut self, outcome: HttpRequestOutcome) {
+        self.attempted += 1;
+        self.latencies.push(outcome.latency);
+        if let Some(status) = outcome.status {
+            self.responses += 1;
+            *self.status_counts.entry(status.as_u16()).or_default() += 1;
+            self.response_body_bytes = self.response_body_bytes.saturating_add(outcome.body_bytes);
+            if !matches!(status, StatusCode::OK | StatusCode::NOT_FOUND) {
+                self.unexpected_statuses += 1;
+                push_failure(
+                    &mut self.failure_samples,
+                    &outcome,
+                    "status",
+                    status.to_string(),
+                );
+            }
+        }
+        if let Some(category) = outcome.error_category {
+            self.transport_errors += 1;
+            push_failure(
+                &mut self.failure_samples,
+                &outcome,
+                category,
+                outcome
+                    .error_detail
+                    .clone()
+                    .unwrap_or_else(|| "unknown error".to_string()),
+            );
+        }
+    }
+
+    fn finish(self, elapsed: Duration) -> HttpReplayResult {
+        HttpReplayResult {
+            attempted: self.attempted,
+            responses: self.responses,
+            transport_errors: self.transport_errors,
+            unexpected_statuses: self.unexpected_statuses,
+            status_counts: self.status_counts,
+            response_body_bytes: self.response_body_bytes,
+            elapsed_ms: elapsed.as_secs_f64() * 1_000.0,
+            throughput_rps: if elapsed.is_zero() {
+                0.0
+            } else {
+                self.attempted as f64 / elapsed.as_secs_f64()
+            },
+            latency_ms: summarize_latencies(self.latencies),
+            failure_samples: self.failure_samples,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -334,10 +455,20 @@ pub async fn run_http_replay(config: HttpReplayConfig) -> Result<HttpReplayRepor
     validate_config(&config)?;
     let trace_file = File::open(&config.trace_path)
         .with_context(|| format!("open HTTP replay trace {}", config.trace_path.display()))?;
-    let entries = read_trace(BufReader::new(trace_file))?;
+    // Fingerprint during the parse: reopening the file to hash it separately
+    // would let a concurrent replacement describe different bytes than were
+    // executed.
+    let (entries, digest) = read_trace_with_digest(BufReader::new(trace_file))?;
     ensure!(!entries.is_empty(), "HTTP replay trace must not be empty");
-    let plans = plan_requests(&entries, &config.target)?;
-    let trace = fingerprint_trace(&config.trace_path, entries.len())?;
+    // Reject a malformed late entry before issuing any live request, but do
+    // not retain a second trace-sized vector of URL plans.
+    validate_trace_requests(&entries, &config.target)?;
+    let trace = TraceFingerprint {
+        path: config.trace_path.clone(),
+        requests: entries.len(),
+        bytes: digest.bytes,
+        fnv1a64: format_fnv1a64(digest.fnv1a64),
+    };
 
     let client = Client::builder()
         .timeout(config.request_timeout)
@@ -351,9 +482,9 @@ pub async fn run_http_replay(config: HttpReplayConfig) -> Result<HttpReplayRepor
     };
 
     let started_at = Instant::now();
-    let outcomes = execute_plans(&client, &plans, &entries, config.mode).await?;
+    let outcomes = execute_requests(&client, &entries, &config.target, config.mode).await?;
     let elapsed = started_at.elapsed();
-    let result = summarize_http_outcomes(outcomes, elapsed);
+    let result = outcomes.finish(elapsed);
 
     let prometheus = match before_metrics {
         None => PrometheusCapture::Disabled,
@@ -384,6 +515,9 @@ pub async fn run_http_replay(config: HttpReplayConfig) -> Result<HttpReplayRepor
             redirects: false,
             retries: 0,
             cache_control_no_cache: true,
+            max_response_body_bytes: MAX_REPLAY_BODY_BYTES,
+            max_metrics_body_bytes: MAX_METRICS_BODY_BYTES,
+            metrics_scrape_concurrency: METRICS_SCRAPE_CONCURRENCY,
         },
         target: target_report(&config.target),
         result,
@@ -455,77 +589,78 @@ fn validate_http_url(url: &Url, require_root_path: bool) -> Result<()> {
     Ok(())
 }
 
-fn plan_requests(
-    entries: &[TraceEntry],
-    target: &HttpReplayTarget,
-) -> Result<Vec<PlannedHttpRequest>> {
-    entries
-        .iter()
-        .enumerate()
-        .map(|(trace_index, entry)| {
-            let tileset = TilesetId::try_new(&entry.tileset)
-                .with_context(|| format!("trace request {trace_index} has invalid tileset"))?;
-            let coordinate = TileCoord::new(entry.z, entry.x, entry.y)
-                .with_context(|| format!("trace request {trace_index} has invalid coordinate"))?;
-            let _ = TileId::from(coordinate);
-            let base = match target {
-                HttpReplayTarget::Gateway { gateway_url } => gateway_url,
-                HttpReplayTarget::DirectNodes { node_urls } => {
-                    let node = entry.entry_node.with_context(|| {
-                        format!("trace request {trace_index} has no direct entry_node")
-                    })?;
-                    node_urls.get(node).with_context(|| {
-                        format!(
-                            "trace request {trace_index} entry_node {node} exceeds {} direct targets",
-                            node_urls.len()
-                        )
-                    })?
-                }
-            };
-            let path = format!(
-                "tilesets/{tileset}/{}/{}/{}",
-                entry.z, entry.x, entry.y
-            );
-            let url = base
-                .join(&path)
-                .with_context(|| format!("build tile URL for trace request {trace_index}"))?;
-            Ok(PlannedHttpRequest {
-                trace_index,
-                entry: entry.clone(),
-                url,
-            })
-        })
-        .collect()
+fn validate_trace_requests(entries: &[TraceEntry], target: &HttpReplayTarget) -> Result<()> {
+    for (trace_index, entry) in entries.iter().enumerate() {
+        plan_request(trace_index, entry, target)?;
+    }
+    Ok(())
 }
 
-async fn execute_plans(
+fn plan_request(
+    trace_index: usize,
+    entry: &TraceEntry,
+    target: &HttpReplayTarget,
+) -> Result<PlannedHttpRequest> {
+    let tileset = TilesetId::try_new(&entry.tileset)
+        .with_context(|| format!("trace request {trace_index} has invalid tileset"))?;
+    let coordinate = TileCoord::new(entry.z, entry.x, entry.y)
+        .with_context(|| format!("trace request {trace_index} has invalid coordinate"))?;
+    let _ = TileId::from(coordinate);
+    let base = match target {
+        HttpReplayTarget::Gateway { gateway_url } => gateway_url,
+        HttpReplayTarget::DirectNodes { node_urls } => {
+            let node = entry
+                .entry_node
+                .with_context(|| format!("trace request {trace_index} has no direct entry_node"))?;
+            node_urls.get(node).with_context(|| {
+                format!(
+                    "trace request {trace_index} entry_node {node} exceeds {} direct targets",
+                    node_urls.len()
+                )
+            })?
+        }
+    };
+    let path = format!("tilesets/{tileset}/{}/{}/{}", entry.z, entry.x, entry.y);
+    let url = base
+        .join(&path)
+        .with_context(|| format!("build tile URL for trace request {trace_index}"))?;
+    Ok(PlannedHttpRequest {
+        trace_index,
+        step: entry.step,
+        user: entry.user,
+        ordinal: entry.ordinal,
+        url,
+    })
+}
+
+async fn execute_requests(
     client: &Client,
-    plans: &[PlannedHttpRequest],
     entries: &[TraceEntry],
+    target: &HttpReplayTarget,
     mode: HttpExecutionMode,
-) -> Result<Vec<HttpRequestOutcome>> {
+) -> Result<HttpOutcomeAccumulator> {
+    let mut outcomes = HttpOutcomeAccumulator::with_capacity(entries.len());
     match mode {
         HttpExecutionMode::Serial => {
-            let mut outcomes = Vec::with_capacity(plans.len());
-            for plan in plans {
-                outcomes.push(execute_request(client.clone(), plan.clone()).await);
+            for (trace_index, entry) in entries.iter().enumerate() {
+                let plan = plan_request(trace_index, entry, target)?;
+                outcomes.record(execute_request(client.clone(), plan).await);
             }
-            Ok(outcomes)
         }
         HttpExecutionMode::ViewportBatches => {
-            let mut outcomes = Vec::with_capacity(plans.len());
             for range in viewport_batch_ranges(entries)? {
                 let mut tasks = JoinSet::new();
-                for plan in &plans[range] {
-                    tasks.spawn(execute_request(client.clone(), plan.clone()));
+                for trace_index in range {
+                    let plan = plan_request(trace_index, &entries[trace_index], target)?;
+                    tasks.spawn(execute_request(client.clone(), plan));
                 }
                 while let Some(outcome) = tasks.join_next().await {
-                    outcomes.push(outcome.context("HTTP replay request task failed")?);
+                    outcomes.record(outcome.context("HTTP replay request task failed")?);
                 }
             }
-            Ok(outcomes)
         }
     }
+    Ok(outcomes)
 }
 
 async fn execute_request(client: Client, plan: PlannedHttpRequest) -> HttpRequestOutcome {
@@ -549,23 +684,49 @@ async fn execute_request(client: Client, plan: PlannedHttpRequest) -> HttpReques
         }
     };
     let status = response.status();
-    match response.bytes().await {
-        Ok(body) => HttpRequestOutcome {
-            plan,
-            latency: started_at.elapsed(),
-            status: Some(status),
-            body_bytes: body.len() as u64,
-            error_category: None,
-            error_detail: None,
-        },
-        Err(error) => HttpRequestOutcome {
-            plan,
-            latency: started_at.elapsed(),
-            status: Some(status),
-            body_bytes: 0,
-            error_category: Some("body"),
-            error_detail: Some(error.to_string()),
-        },
+    // The replay only needs the byte count: stream and discard chunks instead
+    // of buffering, and cap the total so a misconfigured target returning a
+    // huge body cannot OOM the replay process under viewport concurrency.
+    let mut response = response;
+    let mut body_bytes = 0u64;
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                body_bytes = body_bytes.saturating_add(chunk.len() as u64);
+                if body_bytes > MAX_REPLAY_BODY_BYTES {
+                    return HttpRequestOutcome {
+                        plan,
+                        latency: started_at.elapsed(),
+                        status: Some(status),
+                        body_bytes,
+                        error_category: Some("oversized_body"),
+                        error_detail: Some(format!(
+                            "response exceeded {MAX_REPLAY_BODY_BYTES} bytes"
+                        )),
+                    };
+                }
+            }
+            Ok(None) => {
+                return HttpRequestOutcome {
+                    plan,
+                    latency: started_at.elapsed(),
+                    status: Some(status),
+                    body_bytes,
+                    error_category: None,
+                    error_detail: None,
+                };
+            }
+            Err(error) => {
+                return HttpRequestOutcome {
+                    plan,
+                    latency: started_at.elapsed(),
+                    status: Some(status),
+                    body_bytes,
+                    error_category: Some("body"),
+                    error_detail: Some(error.to_string()),
+                };
+            }
+        }
     }
 }
 
@@ -581,60 +742,6 @@ fn request_error_category(error: &reqwest::Error) -> &'static str {
     }
 }
 
-fn summarize_http_outcomes(
-    outcomes: Vec<HttpRequestOutcome>,
-    elapsed: Duration,
-) -> HttpReplayResult {
-    let mut result = HttpReplayResult {
-        attempted: outcomes.len(),
-        responses: 0,
-        transport_errors: 0,
-        unexpected_statuses: 0,
-        status_counts: BTreeMap::new(),
-        response_body_bytes: 0,
-        elapsed_ms: elapsed.as_secs_f64() * 1_000.0,
-        throughput_rps: if elapsed.is_zero() {
-            0.0
-        } else {
-            outcomes.len() as f64 / elapsed.as_secs_f64()
-        },
-        latency_ms: HttpLatencySummary::default(),
-        failure_samples: Vec::new(),
-    };
-    let mut latencies = Vec::with_capacity(outcomes.len());
-    for outcome in outcomes {
-        latencies.push(outcome.latency);
-        if let Some(status) = outcome.status {
-            result.responses += 1;
-            *result.status_counts.entry(status.as_u16()).or_default() += 1;
-            result.response_body_bytes += outcome.body_bytes;
-            if !matches!(status, StatusCode::OK | StatusCode::NOT_FOUND) {
-                result.unexpected_statuses += 1;
-                push_failure(
-                    &mut result.failure_samples,
-                    &outcome,
-                    "status",
-                    status.to_string(),
-                );
-            }
-        }
-        if let Some(category) = outcome.error_category {
-            result.transport_errors += 1;
-            push_failure(
-                &mut result.failure_samples,
-                &outcome,
-                category,
-                outcome
-                    .error_detail
-                    .clone()
-                    .unwrap_or_else(|| "unknown error".to_string()),
-            );
-        }
-    }
-    result.latency_ms = summarize_latencies(latencies);
-    result
-}
-
 fn push_failure(
     failures: &mut Vec<HttpFailureSample>,
     outcome: &HttpRequestOutcome,
@@ -646,9 +753,9 @@ fn push_failure(
     }
     failures.push(HttpFailureSample {
         trace_index: outcome.plan.trace_index,
-        step: outcome.plan.entry.step,
-        user: outcome.plan.entry.user,
-        ordinal: outcome.plan.entry.ordinal,
+        step: outcome.plan.step,
+        user: outcome.plan.user,
+        ordinal: outcome.plan.ordinal,
         url: outcome.plan.url.to_string(),
         category,
         detail,
@@ -680,39 +787,70 @@ fn percentile_ms(values: &[Duration], quantile: f64) -> f64 {
 }
 
 async fn scrape_metrics(client: &Client, urls: &[Url]) -> Result<Vec<MetricSnapshot>> {
-    let mut tasks = JoinSet::new();
-    for (index, url) in urls.iter().cloned().enumerate() {
-        let client = client.clone();
-        tasks.spawn(async move {
-            let response = client
-                .get(url.clone())
-                .send()
-                .await
-                .with_context(|| format!("scrape metrics {url}"))?;
-            ensure!(
-                response.status() == StatusCode::OK,
-                "metrics endpoint {url} returned {}",
-                response.status()
-            );
-            let body = response
-                .text()
-                .await
-                .with_context(|| format!("read metrics body {url}"))?;
-            Ok::<_, anyhow::Error>((index, parse_metrics(&body)?))
-        });
+    scrape_metrics_with_limit(client, urls, MAX_METRICS_BODY_BYTES).await
+}
+
+async fn scrape_metrics_with_limit(
+    client: &Client,
+    urls: &[Url],
+    max_body_bytes: u64,
+) -> Result<Vec<MetricSnapshot>> {
+    // Scrape sequentially so peak retained metrics memory is bounded by one
+    // endpoint response rather than `urls.len() * max_body_bytes`.
+    let mut snapshots = Vec::with_capacity(urls.len());
+    for url in urls {
+        let response = client
+            .get(url.clone())
+            .send()
+            .await
+            .with_context(|| format!("scrape metrics {url}"))?;
+        ensure!(
+            response.status() == StatusCode::OK,
+            "metrics endpoint {url} returned {}",
+            response.status()
+        );
+        let body = read_bounded_response(response, max_body_bytes, "metrics endpoint")
+            .await
+            .with_context(|| format!("read metrics body {url}"))?;
+        let body = std::str::from_utf8(&body)
+            .with_context(|| format!("metrics body {url} is not UTF-8"))?;
+        snapshots.push(parse_metrics(body)?);
     }
-    let mut snapshots = vec![None; urls.len()];
-    while let Some(result) = tasks.join_next().await {
-        let (index, snapshot) = result.context("metrics scrape task failed")??;
-        snapshots[index] = Some(snapshot);
+    Ok(snapshots)
+}
+
+async fn read_bounded_response(
+    mut response: Response,
+    max_body_bytes: u64,
+    kind: &str,
+) -> Result<Vec<u8>> {
+    if let Some(content_length) = response.content_length() {
+        ensure!(
+            content_length <= max_body_bytes,
+            "{kind} response declares {content_length} bytes, exceeding {max_body_bytes}"
+        );
     }
-    snapshots
-        .into_iter()
-        .enumerate()
-        .map(|(index, snapshot)| {
-            snapshot.with_context(|| format!("metrics scrape {index} produced no result"))
-        })
-        .collect()
+    let initial_capacity = response
+        .content_length()
+        .unwrap_or_default()
+        .min(max_body_bytes) as usize;
+    let mut body = Vec::with_capacity(initial_capacity);
+    let mut body_bytes = 0_u64;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .with_context(|| format!("stream {kind} response"))?
+    {
+        body_bytes = body_bytes
+            .checked_add(chunk.len() as u64)
+            .context("response byte count overflow")?;
+        ensure!(
+            body_bytes <= max_body_bytes,
+            "{kind} response exceeded {max_body_bytes} bytes"
+        );
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 fn build_prometheus_report(
@@ -729,7 +867,7 @@ fn build_prometheus_report(
     for (index, ((before, after), url)) in before.iter().zip(after).zip(urls).enumerate() {
         let result = ComparableMetrics::from_delta(before, after)
             .with_context(|| format!("metrics target {index} ({url})"))?;
-        aggregate.add_assign(&result);
+        aggregate.add_assign(&result)?;
         nodes.push(PrometheusNodeReport {
             target_index: index,
             metrics_url: url.to_string(),
@@ -877,21 +1015,41 @@ fn parse_labels(input: &str) -> Result<BTreeMap<String, String>> {
     Ok(labels)
 }
 
+fn required_counter_delta(
+    before: &MetricSnapshot,
+    after: &MetricSnapshot,
+    name: &str,
+    labels: &[(&str, &str)],
+) -> Result<u64> {
+    let key = counter_key(name, labels);
+    ensure!(
+        before.samples.contains_key(&key) && after.samples.contains_key(&key),
+        "required counter is unsupported or missing: {}{:?}",
+        key.name,
+        key.labels
+    );
+    counter_delta_for_key(before, after, &key)
+}
+
 fn counter_delta(
     before: &MetricSnapshot,
     after: &MetricSnapshot,
     name: &str,
     labels: &[(&str, &str)],
 ) -> Result<u64> {
+    let key = counter_key(name, labels);
+    counter_delta_for_key(before, after, &key)
+}
+
+fn counter_key(name: &str, labels: &[(&str, &str)]) -> SeriesKey {
     let labels = labels
         .iter()
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
         .collect();
-    let key = SeriesKey {
+    SeriesKey {
         name: name.to_string(),
         labels,
-    };
-    counter_delta_for_key(before, after, &key)
+    }
 }
 
 fn sum_counter_family_delta(
@@ -907,7 +1065,7 @@ fn sum_counter_family_delta(
         .cloned()
         .collect::<BTreeSet<_>>();
     keys.iter().try_fold(0_u64, |total, key| {
-        Ok(total + counter_delta_for_key(before, after, key)?)
+        checked_metric_add(total, counter_delta_for_key(before, after, key)?, name)
     })
 }
 
@@ -938,8 +1096,14 @@ fn counter_delta_for_key(
     let delta = after_value - before_value;
     let rounded = delta.round();
     ensure!(
-        (delta - rounded).abs() < 1e-6 && rounded <= u64::MAX as f64,
+        (delta - rounded).abs() < 1e-6,
         "counter delta is not an integer: {}{:?} delta={delta}",
+        key.name,
+        key.labels
+    );
+    ensure!(
+        (0.0..U64_UPPER_BOUND_EXCLUSIVE).contains(&rounded),
+        "counter delta is outside the u64 range: {}{:?} delta={delta}",
         key.name,
         key.labels
     );
@@ -955,33 +1119,6 @@ fn target_report(target: &HttpReplayTarget) -> HttpTargetReport {
             gateway_url: gateway_url.to_string(),
         },
     }
-}
-
-fn fingerprint_trace(path: &Path, requests: usize) -> Result<TraceFingerprint> {
-    let mut file =
-        File::open(path).with_context(|| format!("open {} for hashing", path.display()))?;
-    let mut buffer = [0_u8; 64 * 1024];
-    let mut hash = FNV_OFFSET_BASIS;
-    let mut bytes = 0_u64;
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .with_context(|| format!("hash {}", path.display()))?;
-        if read == 0 {
-            break;
-        }
-        bytes = bytes.saturating_add(read as u64);
-        for byte in &buffer[..read] {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(FNV_PRIME);
-        }
-    }
-    Ok(TraceFingerprint {
-        path: path.to_path_buf(),
-        requests,
-        bytes,
-        fnv1a64: format!("fnv1a64:{hash:016x}"),
-    })
 }
 
 #[cfg(test)]
@@ -1016,15 +1153,15 @@ mod tests {
         let direct = HttpReplayTarget::DirectNodes {
             node_urls: vec![Url::parse("http://node-0.example/").unwrap()],
         };
-        assert!(plan_requests(&[entry(0, None)], &direct).is_err());
-        assert!(plan_requests(&[entry(0, Some(1))], &direct).is_err());
+        assert!(plan_request(0, &entry(0, None), &direct).is_err());
+        assert!(plan_request(0, &entry(0, Some(1)), &direct).is_err());
 
         let gateway = HttpReplayTarget::Gateway {
             gateway_url: Url::parse("https://gateway.example/").unwrap(),
         };
-        let plans = plan_requests(&[entry(0, None)], &gateway).expect("gateway plan");
+        let plan = plan_request(0, &entry(0, None), &gateway).expect("gateway plan");
         assert_eq!(
-            plans[0].url.as_str(),
+            plan.url.as_str(),
             "https://gateway.example/tilesets/japan/0/0/0"
         );
     }
@@ -1034,6 +1171,7 @@ mod tests {
         let before = parse_metrics(
             r#"
 ishikari_tiles_served_total{source="self_cache"} 2
+ishikari_tile_negative_cache_hits_total 4
 ishikari_external_egress_bytes_total 100
 ishikari_backend_fetch_bytes_total 50
 ishikari_backend_fetch_duration_seconds_count{outcome="success"} 1
@@ -1046,6 +1184,7 @@ ishikari_peer_fetch_total{resource="tile",outcome="success"} 3
             r#"
 ishikari_tiles_served_total{source="self_cache"} 5
 ishikari_tiles_served_total{source="peer_cache"} 1
+ishikari_tile_negative_cache_hits_total 7
 ishikari_external_egress_bytes_total 220
 ishikari_backend_fetch_bytes_total 90
 ishikari_backend_fetch_duration_seconds_count{outcome="success"} 3
@@ -1061,12 +1200,69 @@ ishikari_peer_fetch_total{outcome="success",resource="tile"} 5
         assert_eq!(metrics.backend_fetches, 2);
         assert_eq!(metrics.backend_fetched_chunks, 5);
         assert_eq!(metrics.peer_requests, 2);
+        assert_eq!(metrics.negative_cache_hits, 3);
         assert_eq!(metrics.cache_hit_rate, 1.0);
 
         let reset = parse_metrics("ishikari_external_egress_bytes_total 99\n").unwrap();
         let error = counter_delta(&before, &reset, "ishikari_external_egress_bytes_total", &[])
             .expect_err("counter reset must fail");
         assert!(error.to_string().contains("counter reset"));
+    }
+
+    #[test]
+    fn prometheus_delta_rejects_targets_without_exact_negative_hit_metric() {
+        let snapshot = parse_metrics("ishikari_external_egress_bytes_total 0\n").unwrap();
+        let error = ComparableMetrics::from_delta(&snapshot, &snapshot)
+            .expect_err("legacy target must not silently report zero negative hits");
+        assert!(
+            error
+                .to_string()
+                .contains("required counter is unsupported")
+        );
+    }
+
+    #[test]
+    fn prometheus_delta_rejects_counter_aggregate_overflow() {
+        let before = parse_metrics(
+            "ishikari_peer_fetch_total{resource=\"tile\"} 0\nishikari_peer_fetch_total{resource=\"provider\"} 0\n",
+        )
+        .unwrap();
+        // Both values are exactly representable f64 integers and individually
+        // fit in u64, but their family aggregate does not.
+        let after = parse_metrics(
+            "ishikari_peer_fetch_total{resource=\"tile\"} 9223372036854775808\nishikari_peer_fetch_total{resource=\"provider\"} 9223372036854775808\n",
+        )
+        .unwrap();
+        let error = sum_counter_family_delta(&before, &after, "ishikari_peer_fetch_total")
+            .expect_err("overflowing family total must fail");
+        assert!(error.to_string().contains("aggregate overflow"));
+
+        let out_of_range =
+            parse_metrics("ishikari_peer_fetch_total{resource=\"tile\"} 18446744073709551616\n")
+                .unwrap();
+        let error = sum_counter_family_delta(
+            &MetricSnapshot::default(),
+            &out_of_range,
+            "ishikari_peer_fetch_total",
+        )
+        .expect_err("out-of-range individual counter must fail");
+        assert!(error.to_string().contains("outside the u64 range"));
+    }
+
+    #[tokio::test]
+    async fn metrics_scrape_rejects_oversized_responses() {
+        let router = Router::new().route("/metrics", get(|| async { "x".repeat(17) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let url = Url::parse(&format!("http://{address}/metrics")).unwrap();
+        let error = scrape_metrics_with_limit(&Client::new(), &[url], 16)
+            .await
+            .expect_err("oversized metrics body must fail");
+        assert!(error.to_string().contains("read metrics body"));
+        assert!(format!("{error:#}").contains("exceeding 16"));
     }
 
     #[tokio::test]
@@ -1095,7 +1291,7 @@ ishikari_peer_fetch_total{outcome="success",resource="tile"} 5
                         async move {
                             let count = requests.load(Ordering::Relaxed);
                             format!(
-                                "ishikari_tiles_served_total{{source=\"self_cache\"}} {count}\nishikari_external_egress_bytes_total {}\n",
+                                "ishikari_tiles_served_total{{source=\"self_cache\"}} {count}\nishikari_tile_negative_cache_hits_total 0\nishikari_external_egress_bytes_total {}\n",
                                 count * 4
                             )
                         }
@@ -1136,6 +1332,12 @@ ishikari_peer_fetch_total{outcome="success",resource="tile"} 5
         .expect("HTTP replay");
 
         assert!(report.is_success());
+        let serialized = serde_json::to_value(&report).expect("serialize HTTP report");
+        assert_eq!(serialized["schema_version"], 2);
+        assert_eq!(
+            serialized["execution"]["max_metrics_body_bytes"],
+            MAX_METRICS_BODY_BYTES
+        );
         assert_eq!(report.result.responses, 2);
         assert_eq!(report.result.status_counts.get(&200), Some(&2));
         assert_eq!(requests.load(Ordering::Relaxed), 2);

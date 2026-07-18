@@ -136,12 +136,9 @@ impl TileSource {
         match self {
             Self::SelfTileCache | Self::SelfChunkCache => "self_cache",
             Self::SelfBackend => "self_backend",
-            Self::NegativeCache => "miss",
             Self::PeerCache => "peer_cache",
             Self::PeerBackend => "peer_backend",
-            Self::SelfMiss => "miss",
-            Self::PeerMiss => "miss",
-            Self::Miss => "miss",
+            Self::NegativeCache | Self::SelfMiss | Self::PeerMiss | Self::Miss => "miss",
         }
     }
 }
@@ -243,7 +240,7 @@ impl ResourceResolver {
     pub fn cache_outcomes(&self, source: TileSource) -> &'static [&'static str] {
         match source {
             TileSource::SelfTileCache => &["hit"],
-            TileSource::NegativeCache => &["negative"],
+            TileSource::NegativeCache => &["negative", "negative_hit"],
             TileSource::SelfChunkCache | TileSource::SelfBackend => &["miss", "insert"],
             TileSource::PeerCache | TileSource::PeerBackend
                 if self.peer_tile_cache_policy == PeerTileCachePolicy::EntryAndOwner =>
@@ -709,6 +706,9 @@ pub enum TilesetError {
     RetryableUpstream(String),
     #[error("{0}")]
     Timeout(String),
+    /// Backend fetch admission is saturated; shed with 503 rather than queue.
+    #[error("{0}")]
+    Overload(String),
     #[error("forward miss")]
     Miss,
     #[error("{0}")]
@@ -737,17 +737,15 @@ fn format_error_chain(error: &anyhow::Error) -> String {
 fn internal_tileset_error(error: anyhow::Error) -> TilesetError {
     // Classify by the typed error in the chain, not by matching the message
     // string: a backend read timeout surfaces as `StorageError::Timeout`.
-    let timed_out = error.chain().any(|cause| {
-        matches!(
-            cause.downcast_ref::<StorageError>(),
-            Some(StorageError::Timeout(_))
-        )
-    });
+    let storage_error = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<StorageError>());
     let message = format_error_chain(&error);
-    if timed_out {
-        return TilesetError::Timeout(message);
+    match storage_error {
+        Some(StorageError::Timeout(_)) => TilesetError::Timeout(message),
+        Some(StorageError::Overload(_)) => TilesetError::Overload(message),
+        _ => TilesetError::Internal(message),
     }
-    TilesetError::Internal(message)
 }
 
 #[cfg(feature = "simulator-support")]
@@ -765,9 +763,9 @@ fn decode_internal_tileset(encoded: &str) -> Result<TilesetId, PeerFetchError> {
 #[cfg(feature = "simulator-support")]
 fn simulator_fetch_error(error: TilesetError) -> PeerFetchError {
     match error {
-        TilesetError::RetryableUpstream(message) | TilesetError::Timeout(message) => {
-            PeerFetchError::Retryable(message)
-        }
+        TilesetError::RetryableUpstream(message)
+        | TilesetError::Timeout(message)
+        | TilesetError::Overload(message) => PeerFetchError::Retryable(message),
         TilesetError::Miss => PeerFetchError::NotFound,
         TilesetError::Upstream(message) | TilesetError::Internal(message) => {
             PeerFetchError::Fatal(message)
@@ -888,5 +886,14 @@ mod tests {
         assert!(tile.is_none());
         assert_eq!(source, TileSource::NegativeCache);
         assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+
+        assert_eq!(
+            resolver.cache_outcomes(TileSource::NegativeCache),
+            ["negative", "negative_hit"]
+        );
+        assert_eq!(
+            resolver.cache_outcomes(TileSource::PeerMiss),
+            ["miss", "negative"]
+        );
     }
 }

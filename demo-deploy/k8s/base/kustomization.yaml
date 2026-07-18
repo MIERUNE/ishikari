@@ -8,5 +8,7 @@ namespace: map-demo
 resources:
   - serviceaccount.yaml
   - deployment.yaml
+  - networkpolicy.yaml
+  - poddisruptionbudget.yaml
   - service-gossip.yaml
   - service-http.yaml

@@ -1,8 +1,8 @@
 use std::{
     collections::HashSet,
-    fs::{self, File},
+    fs::File,
     hash::Hash,
-    io::{BufReader, BufWriter, Read, Write},
+    io::{BufReader, Read, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -11,14 +11,22 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ChurnConfig, ChurnPlan, ClusterConfig, EntryAffinity, ModeledCluster, SimReport, TileCatalog,
-    read_trace, run_modeled_churn_trace,
+    AtomicOutputFile, ChurnConfig, ChurnPlan, ClusterConfig, EntryAffinity, ModeledCluster,
+    SimReport, TileCatalog, ensure_output_distinct, local_source_archives_for_tilesets,
+    read_trace_with_digest, run_modeled_churn_trace,
+    trace::{fnv1a64, format_fnv1a64},
 };
 
-const SWEEP_SCHEMA_VERSION: u32 = 1;
-const DEFAULT_MAX_RUNS: usize = 10_000;
-const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+const SWEEP_SPEC_SCHEMA_VERSION: u32 = 1;
+// v2 splits positive and negative L1 hits in final results and churn samples.
+const SWEEP_REPORT_SCHEMA_VERSION: u32 = 2;
+/// Non-overridable ceiling that bounds Cartesian expansion and the retained
+/// configuration vector. A spec may choose a lower `max_runs`, never a higher
+/// one.
+const HARD_MAX_SWEEP_RUNS: usize = 10_000;
+/// Sweep specs describe axes, not bulk data; cap the bounded read before JSON
+/// parsing so an accidental or hostile file cannot be loaded wholesale.
+const MAX_SWEEP_SPEC_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 struct SweepSpec {
@@ -64,6 +72,7 @@ struct SweepGrid {
 #[derive(Serialize)]
 struct SweepRunRecord {
     schema_version: u32,
+    sweep_spec_schema_version: u32,
     kind: &'static str,
     run_index: usize,
     run_count: usize,
@@ -92,25 +101,28 @@ struct FileFingerprint {
 
 /// Runs a versioned, replay-only modeled-cache parameter sweep.
 ///
-/// The output is JSONL with one self-contained run document per line. Each line
-/// is flushed before the next run starts, so an interrupted sweep leaves a valid
-/// prefix that can still be analyzed.
+/// The output is JSONL with one self-contained run document per line. It is
+/// built in a sibling temporary file and atomically published only after every
+/// run succeeds, so a failed or interrupted sweep leaves any prior output
+/// untouched.
 pub async fn run_sweep(spec_path: &Path, output_path: &Path) -> Result<()> {
-    let spec_bytes =
-        fs::read(spec_path).with_context(|| format!("read sweep spec {}", spec_path.display()))?;
+    let mut spec_bytes = Vec::with_capacity(MAX_SWEEP_SPEC_BYTES.min(64 * 1024));
+    File::open(spec_path)
+        .with_context(|| format!("open sweep spec {}", spec_path.display()))?
+        .take((MAX_SWEEP_SPEC_BYTES + 1) as u64)
+        .read_to_end(&mut spec_bytes)
+        .with_context(|| format!("read sweep spec {}", spec_path.display()))?;
+    ensure!(
+        spec_bytes.len() <= MAX_SWEEP_SPEC_BYTES,
+        "sweep spec {} exceeds {MAX_SWEEP_SPEC_BYTES} bytes",
+        spec_path.display()
+    );
     let mut spec: SweepSpec = serde_json::from_slice(&spec_bytes)
         .with_context(|| format!("parse sweep spec {}", spec_path.display()))?;
     spec.validate()?;
 
     let base_dir = spec_path.parent().unwrap_or_else(|| Path::new("."));
     let trace_path = resolve_path(base_dir, &spec.trace);
-    ensure!(
-        output_path != spec_path && output_path != trace_path,
-        "sweep output must not overwrite the sweep spec or trace"
-    );
-    let trace_file = File::open(&trace_path)
-        .with_context(|| format!("open sweep trace {}", trace_path.display()))?;
-    let entries = read_trace(BufReader::new(trace_file))?;
 
     let tileset_source = PathBuf::from(&spec.base_cluster.tileset_sources);
     if tileset_source.is_relative() {
@@ -119,21 +131,41 @@ pub async fn run_sweep(spec_path: &Path, output_path: &Path) -> Result<()> {
             .into_owned();
     }
 
+    let trace_file = File::open(&trace_path)
+        .with_context(|| format!("open sweep trace {}", trace_path.display()))?;
+    // Fingerprint during the parse so the report describes exactly the bytes
+    // that were replayed, even if the file is replaced concurrently.
+    let (entries, trace_digest) = read_trace_with_digest(BufReader::new(trace_file))?;
+
+    // Protect exactly the local archives this trace resolves through the
+    // production source parser, including nested, symlinked, and encoded file
+    // paths. Directory scans can miss those aliases or protect unrelated data.
+    let mut protected = vec![spec_path.to_path_buf(), trace_path.clone()];
+    protected.extend(local_source_archives_for_tilesets(
+        &spec.base_cluster.tileset_sources,
+        entries.iter().map(|entry| entry.tileset.as_str()),
+    )?);
+    ensure_output_distinct(output_path, protected.iter().map(PathBuf::as_path))
+        .context("validate sweep output path")?;
+
     let run_count = spec.run_count()?;
     let configs = spec.expanded_configs()?;
 
     let catalog = Arc::new(TileCatalog::build(&spec.base_cluster.tileset_sources, &entries).await?);
     let catalog_tiles = catalog.len();
-    let trace_fingerprint = fingerprint_file(&trace_path)?;
+    let trace_fingerprint = FileFingerprint {
+        path: trace_path.clone(),
+        bytes: trace_digest.bytes,
+        fnv1a64: format_fnv1a64(trace_digest.fnv1a64),
+    };
     let spec_fingerprint = FileFingerprint {
         path: spec_path.to_path_buf(),
         bytes: spec_bytes.len() as u64,
-        fnv1a64: format_hash(fnv1a64(&spec_bytes)),
+        fnv1a64: format_fnv1a64(fnv1a64(&spec_bytes)),
     };
 
-    let output = File::create(output_path)
+    let mut output = AtomicOutputFile::create(output_path)
         .with_context(|| format!("create sweep output {}", output_path.display()))?;
-    let mut writer = BufWriter::new(output);
     let plan = ChurnPlan::empty();
     let mut run_index = 0;
 
@@ -153,7 +185,8 @@ pub async fn run_sweep(spec_path: &Path, output_path: &Path) -> Result<()> {
             )?;
             let run_id = run_id(entry_seed, &config)?;
             let record = SweepRunRecord {
-                schema_version: SWEEP_SCHEMA_VERSION,
+                schema_version: SWEEP_REPORT_SCHEMA_VERSION,
+                sweep_spec_schema_version: spec.schema_version,
                 kind: "ishikari_sim_sweep_run",
                 run_index,
                 run_count,
@@ -176,21 +209,24 @@ pub async fn run_sweep(spec_path: &Path, output_path: &Path) -> Result<()> {
                 churn,
                 result: cluster.report(),
             };
-            serde_json::to_writer(&mut writer, &record).context("serialize sweep run")?;
-            writer.write_all(b"\n").context("write sweep newline")?;
-            writer.flush().context("flush sweep run")?;
+            serde_json::to_writer(output.writer(), &record).context("serialize sweep run")?;
+            output
+                .writer()
+                .write_all(b"\n")
+                .context("write sweep newline")?;
+            output.writer().flush().context("flush sweep run")?;
             run_index += 1;
         }
     }
 
-    Ok(())
+    output.finish()
 }
 
 impl SweepSpec {
     fn validate(&self) -> Result<()> {
         ensure!(
-            self.schema_version == SWEEP_SCHEMA_VERSION,
-            "unsupported sweep schema version {}; expected {SWEEP_SCHEMA_VERSION}",
+            self.schema_version == SWEEP_SPEC_SCHEMA_VERSION,
+            "unsupported sweep schema version {}; expected {SWEEP_SPEC_SCHEMA_VERSION}",
             self.schema_version
         );
         ensure!(
@@ -202,6 +238,11 @@ impl SweepSpec {
             "sample_every_requests must be greater than zero"
         );
         ensure!(self.max_runs > 0, "max_runs must be greater than zero");
+        ensure!(
+            self.max_runs <= HARD_MAX_SWEEP_RUNS,
+            "max_runs={} exceeds the hard limit {HARD_MAX_SWEEP_RUNS}",
+            self.max_runs
+        );
         validate_unique("entry_seeds", &self.entry_seeds)?;
         self.grid.validate()?;
         let run_count = self.run_count()?;
@@ -335,49 +376,10 @@ fn resolve_path(base_dir: &Path, path: &Path) -> PathBuf {
     }
 }
 
-fn fingerprint_file(path: &Path) -> Result<FileFingerprint> {
-    let mut file =
-        File::open(path).with_context(|| format!("open {} for hashing", path.display()))?;
-    let mut buffer = [0_u8; 64 * 1024];
-    let mut hash = FNV_OFFSET_BASIS;
-    let mut bytes = 0_u64;
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .with_context(|| format!("hash {}", path.display()))?;
-        if read == 0 {
-            break;
-        }
-        bytes = bytes.saturating_add(read as u64);
-        hash = fnv1a64_continue(hash, &buffer[..read]);
-    }
-    Ok(FileFingerprint {
-        path: path.to_path_buf(),
-        bytes,
-        fnv1a64: format_hash(hash),
-    })
-}
-
 fn run_id(entry_seed: u64, config: &ClusterConfig) -> Result<String> {
     let bytes =
         serde_json::to_vec(&(entry_seed, config)).context("serialize sweep run identity")?;
-    Ok(format_hash(fnv1a64(&bytes)))
-}
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    fnv1a64_continue(FNV_OFFSET_BASIS, bytes)
-}
-
-fn fnv1a64_continue(mut hash: u64, bytes: &[u8]) -> u64 {
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
-}
-
-fn format_hash(hash: u64) -> String {
-    format!("fnv1a64:{hash:016x}")
+    Ok(format_fnv1a64(fnv1a64(&bytes)))
 }
 
 fn default_entry_seeds() -> Vec<u64> {
@@ -389,11 +391,13 @@ const fn default_sample_every_requests() -> u64 {
 }
 
 const fn default_max_runs() -> usize {
-    DEFAULT_MAX_RUNS
+    HARD_MAX_SWEEP_RUNS
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
 
     fn parse_spec(json: &str) -> SweepSpec {
@@ -469,10 +473,89 @@ mod tests {
                 .to_string()
                 .contains("exceeding max_runs=3")
         );
+
+        let raised_safety_limit = parse_spec(&format!(
+            r#"{{
+                "schema_version": 1,
+                "trace": "trace.jsonl",
+                "max_runs": {}
+            }}"#,
+            HARD_MAX_SWEEP_RUNS + 1
+        ));
+        assert!(
+            raised_safety_limit
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds the hard limit")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_spec_before_parsing_or_output_creation() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let spec_path = std::env::temp_dir().join(format!(
+            "ishikari-sweep-spec-{}-{suffix}.json",
+            std::process::id()
+        ));
+        let output_path = spec_path.with_extension("jsonl");
+        std::fs::write(&spec_path, vec![b' '; MAX_SWEEP_SPEC_BYTES + 1]).unwrap();
+
+        let error = run_sweep(&spec_path, &output_path)
+            .await
+            .expect_err("oversized sweep spec must fail");
+        assert!(error.to_string().contains("exceeds"));
+        assert!(!output_path.exists());
+
+        let _ = std::fs::remove_file(spec_path);
+    }
+
+    #[test]
+    fn sweep_run_serializes_report_v2_and_spec_v1() {
+        let fingerprint = FileFingerprint {
+            path: PathBuf::from("trace.jsonl"),
+            bytes: 0,
+            fnv1a64: "fnv1a64:0000000000000000".to_string(),
+        };
+        let record = SweepRunRecord {
+            schema_version: SWEEP_REPORT_SCHEMA_VERSION,
+            sweep_spec_schema_version: SWEEP_SPEC_SCHEMA_VERSION,
+            kind: "ishikari_sim_sweep_run",
+            run_index: 0,
+            run_count: 1,
+            run_id: "run".to_string(),
+            simulator_version: "test",
+            execution_mode: "sweep_serial",
+            cache_mode: "modeled",
+            entry_seed: 1,
+            entry_affinity: EntryAffinity::PerRequest,
+            viewport_batches: false,
+            sample_every_requests: 1_000,
+            trace: fingerprint.clone(),
+            sweep_spec: fingerprint,
+            catalog_tiles: 0,
+            cluster: ClusterConfig::default(),
+            churn: crate::ChurnReport {
+                config: ChurnConfig::default(),
+                events: Vec::new(),
+                samples: Vec::new(),
+            },
+            result: SimReport::default(),
+        };
+
+        let value = serde_json::to_value(record).expect("serialize sweep run");
+        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["sweep_spec_schema_version"], 1);
     }
 
     #[test]
     fn fnv_hash_is_stable() {
-        assert_eq!(format_hash(fnv1a64(b"hello")), "fnv1a64:a430d84680aabd0b");
+        assert_eq!(
+            format_fnv1a64(fnv1a64(b"hello")),
+            "fnv1a64:a430d84680aabd0b"
+        );
     }
 }

@@ -27,14 +27,14 @@ use crate::{
     interned::TilesetId,
     pmtiles::{MLT_CONTENT_TYPE, TileCoord, TileData, TileId, TileType},
     server::{
-        AppState, HttpError, apply_origin_vary, bytes_response, cache, conditional::Validators,
-        get_origin, provider::path_percent_encode,
+        AppState, HttpError, bytes_response, cache, conditional::Validators, get_origin,
+        provider::path_percent_encode,
     },
 };
 
 use super::{
     error::tileset_error_response,
-    mlt::{RequestedTileFormat, mlt_response_bytes, negotiate_format},
+    mlt::{RequestedTileFormat, mlt_response_bytes, negotiate_format, transcode_mlt},
     tile::{resolve_archive, tile_data_response},
 };
 
@@ -124,6 +124,11 @@ impl DerivedTileKey {
 #[derive(Clone)]
 pub(crate) enum DerivedOutcome {
     Tile(TileData),
+    /// Generated with an edge fallback because an in-world non-center DEM
+    /// source was absent or hit a transient error. Served normally, but cached
+    /// only for the short negative TTL so mutable source absence or a temporary
+    /// failure cannot pin a seam into derived or downstream caches indefinitely.
+    Degraded(TileData),
     Absent,
 }
 
@@ -186,32 +191,50 @@ async fn serve_tilejson(
         .encoding
         .as_deref()
         .is_some_and(|encoding| encoding.eq_ignore_ascii_case("mlt"));
-    let suffix = if wants_mlt { ".mlt" } else { ".mvt" };
     let base_url = get_origin(&headers);
     let maxzoom = state
         .mapterhorn()
         .expect("validated_mapterhorn checked configuration")
         .maxzoom();
-    let fields = match product {
-        DerivedProduct::Contours => json!({ "ele": "Number", "level": "Number" }),
-        DerivedProduct::Hillshade => json!({ "class": "String", "level": "Number" }),
-        // Raster product has no vector layer; the TileJSON is not used for it.
-        DerivedProduct::HillshadeRaster
-        | DerivedProduct::HillshadeWebpLossy
-        | DerivedProduct::HillshadeJpeg => json!({}),
+    let document =
+        derived_tilejson_document(&tileset_id, &base_url, &info, product, wants_mlt, maxzoom);
+    // Origin-derived like the base TileJSON: validate by a strong ETag over the
+    // exact bytes served so conditional requests can 304.
+    let body = serde_json::to_vec(&document).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("derived tilejson serialization failed: {error}"),
+        )
+    })?;
+    let validators = Validators::for_derived_body(&body);
+    Ok(validators.origin_varying_json_response(&headers, body, cache::TILEJSON))
+}
+
+/// Builds the derived-product TileJSON. Raster products serve WebP/JPEG bytes:
+/// their TileJSON advertises the image format with plain tile URLs and no
+/// vector metadata, or a generic client would try to decode image bytes as
+/// vector tiles. Vector products advertise `pbf` with the negotiated encoding.
+fn derived_tilejson_document(
+    tileset_id: &TilesetId,
+    base_url: &str,
+    info: &crate::storage::TilesetInfo,
+    product: DerivedProduct,
+    wants_mlt: bool,
+    maxzoom: u8,
+) -> serde_json::Value {
+    let suffix = if product.is_raster() {
+        ""
+    } else if wants_mlt {
+        ".mlt"
+    } else {
+        ".mvt"
     };
-    let document = json!({
+    let mut document = json!({
         "tilejson": "3.0.0",
         "tiles": [format!(
             "{base_url}/tilesets/{tileset_id}/derived/{}/{{z}}/{{x}}/{{y}}{suffix}",
             product.path(),
         )],
-        "vector_layers": [{
-            "id": product.layer(),
-            "fields": fields,
-            "minzoom": info.header.min_zoom,
-            "maxzoom": maxzoom
-        }],
         "attribution": info.metadata.attribution.clone(),
         "bounds": [
             info.header.min_longitude,
@@ -227,33 +250,31 @@ async fn serve_tilejson(
         "minzoom": info.header.min_zoom,
         "maxzoom": maxzoom,
         "name": format!("{tileset_id} {}", product.path()),
-        "format": "pbf",
-        "encoding": if wants_mlt { "mlt" } else { "mvt" }
     });
-    // Origin-derived like the base TileJSON: validate by a strong ETag over the
-    // exact bytes served so conditional requests can 304.
-    let body = serde_json::to_vec(&document).map_err(|error| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("derived tilejson serialization failed: {error}"),
-        )
-    })?;
-    let validators = Validators::for_derived_body(&body);
-    if validators.not_modified(&headers) {
-        let mut response = Response::new(Body::empty());
-        *response.status_mut() = StatusCode::NOT_MODIFIED;
-        response.headers_mut().insert(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static(cache::TILEJSON),
-        );
-        validators.apply(response.headers_mut());
-        apply_origin_vary(response.headers_mut());
-        return Ok(response);
-    }
-    let mut response = bytes_response(body, "application/json", Some(cache::TILEJSON));
-    validators.apply(response.headers_mut());
-    apply_origin_vary(response.headers_mut());
-    Ok(response)
+    let extra = if product.is_raster() {
+        json!({
+            "format": if product == DerivedProduct::HillshadeJpeg { "jpg" } else { "webp" },
+        })
+    } else {
+        json!({
+            "vector_layers": [{
+                "id": product.layer(),
+                "fields": match product {
+                    DerivedProduct::Contours => json!({ "ele": "Number", "level": "Number" }),
+                    _ => json!({ "class": "String", "level": "Number" }),
+                },
+                "minzoom": info.header.min_zoom,
+                "maxzoom": maxzoom
+            }],
+            "format": "pbf",
+            "encoding": if wants_mlt { "mlt" } else { "mvt" }
+        })
+    };
+    document
+        .as_object_mut()
+        .expect("document is an object")
+        .extend(extra.as_object().expect("extra is an object").clone());
+    document
 }
 
 pub(crate) async fn derived_tile_handler(
@@ -351,14 +372,19 @@ async fn serve_derived_tile(
         None => local_derived_output(&state, &request).await?,
     };
 
-    let generated = match outcome {
-        DerivedOutcome::Tile(tile) => tile,
+    let (generated, degraded) = match outcome {
+        DerivedOutcome::Tile(tile) => (tile, false),
+        DerivedOutcome::Degraded(tile) => (tile, true),
         DerivedOutcome::Absent => {
             return Ok(absent_derived_response(state.derived_negative_ttl()));
         }
     };
     state.metrics.add_egress_bytes(generated.bytes.len() as u64);
-    let response = tile_data_response(generated);
+    let response = if degraded {
+        degraded_derived_response(generated, state.derived_negative_ttl())
+    } else {
+        tile_data_response(generated)
+    };
     debug!(
         endpoint = "derived_tile",
         tileset_id = %request.tileset_id,
@@ -415,17 +441,33 @@ async fn local_derived_output(
         )
         .await
         .map_err(|error| (*error).clone())?;
-    let generated = match outcome {
+    let (generated, degraded) = match outcome {
         DerivedOutcome::Absent => return Ok(DerivedOutcome::Absent),
-        DerivedOutcome::Tile(tile) => tile,
+        DerivedOutcome::Tile(tile) => (tile, false),
+        DerivedOutcome::Degraded(tile) => (tile, true),
+    };
+    // Degraded-ness survives representation changes: an MLT transcode of a
+    // degraded MVT is still degraded.
+    let wrap = if degraded {
+        DerivedOutcome::Degraded
+    } else {
+        DerivedOutcome::Tile
     };
     match request.format {
-        RequestedTileFormat::AsStored => Ok(DerivedOutcome::Tile(generated)),
+        RequestedTileFormat::AsStored => Ok(wrap(generated)),
         RequestedTileFormat::Mlt => {
-            let cache_id = derived_resource_id(&request.tileset_id, request.product);
-            let (bytes, content_encoding, _) =
-                mlt_response_bytes(state, &cache_id, request.tile_id, generated).await?;
-            Ok(DerivedOutcome::Tile(TileData {
+            let (bytes, content_encoding) = if degraded {
+                // The generic MLT cache has no per-entry expiry. Transcode a
+                // refreshable source without inserting it there, otherwise the
+                // MLT seam would outlive the short-lived source MVT.
+                uncached_derived_mlt_response_bytes(state, generated).await?
+            } else {
+                let cache_id = derived_resource_id(&request.tileset_id, request.product);
+                let (bytes, content_encoding, _) =
+                    mlt_response_bytes(state, &cache_id, request.tile_id, generated).await?;
+                (bytes, content_encoding)
+            };
+            Ok(wrap(TileData {
                 bytes,
                 content_type: MLT_CONTENT_TYPE,
                 content_encoding,
@@ -480,8 +522,10 @@ fn derived_resource_id(tileset_id: &TilesetId, product: DerivedProduct) -> Tiles
 
 const DERIVED_WIRE_MAGIC_V1: &[u8; 8] = b"ISKRDRV1";
 const DERIVED_WIRE_MAGIC_V2: &[u8; 8] = b"ISKRDRV2";
+const DERIVED_WIRE_MAGIC_V3: &[u8; 8] = b"ISKRDRV3";
 const DERIVED_WIRE_ABSENT: u8 = 0;
 const DERIVED_WIRE_TILE: u8 = 1;
+const DERIVED_WIRE_DEGRADED: u8 = 2;
 const DERIVED_WIRE_CONTENT_MVT: u8 = 1;
 const DERIVED_WIRE_CONTENT_MLT: u8 = 2;
 const DERIVED_WIRE_CONTENT_PNG: u8 = 3;
@@ -496,14 +540,14 @@ const DERIVED_WIRE_ENCODING_ZSTD: u8 = 3;
 
 fn encode_derived_wire(outcome: &DerivedOutcome) -> Result<Bytes, &'static str> {
     let wire = match outcome {
+        // Keep clean/absent responses on v2 so older requesters can continue to
+        // consume the common cases during a rolling update. Only the new status
+        // needs v3; an older requester rejects it and safely generates locally.
         DerivedOutcome::Tile(tile) => {
-            let mut wire = Vec::with_capacity(DERIVED_WIRE_MAGIC_V2.len() + 3 + tile.bytes.len());
-            wire.extend_from_slice(DERIVED_WIRE_MAGIC_V2);
-            wire.push(DERIVED_WIRE_TILE);
-            wire.push(derived_content_type_code(tile.content_type)?);
-            wire.push(derived_content_encoding_code(tile.content_encoding)?);
-            wire.extend_from_slice(&tile.bytes);
-            wire
+            encode_derived_wire_tile(DERIVED_WIRE_MAGIC_V2, DERIVED_WIRE_TILE, tile)?
+        }
+        DerivedOutcome::Degraded(tile) => {
+            encode_derived_wire_tile(DERIVED_WIRE_MAGIC_V3, DERIVED_WIRE_DEGRADED, tile)?
         }
         DerivedOutcome::Absent => {
             let mut wire = Vec::with_capacity(DERIVED_WIRE_MAGIC_V2.len() + 1);
@@ -515,6 +559,20 @@ fn encode_derived_wire(outcome: &DerivedOutcome) -> Result<Bytes, &'static str> 
     Ok(Bytes::from(wire))
 }
 
+fn encode_derived_wire_tile(
+    magic: &[u8; 8],
+    status: u8,
+    tile: &TileData,
+) -> Result<Vec<u8>, &'static str> {
+    let mut wire = Vec::with_capacity(magic.len() + 3 + tile.bytes.len());
+    wire.extend_from_slice(magic);
+    wire.push(status);
+    wire.push(derived_content_type_code(tile.content_type)?);
+    wire.push(derived_content_encoding_code(tile.content_encoding)?);
+    wire.extend_from_slice(&tile.bytes);
+    Ok(wire)
+}
+
 fn decode_derived_wire(
     wire: Bytes,
     product: DerivedProduct,
@@ -524,6 +582,9 @@ fn decode_derived_wire(
         return Err("invalid derived wire magic");
     }
     let magic = &wire[..DERIVED_WIRE_MAGIC_V2.len()];
+    if magic == DERIVED_WIRE_MAGIC_V3 {
+        return decode_derived_wire_v3(wire, product, format);
+    }
     if magic == DERIVED_WIRE_MAGIC_V2 {
         return decode_derived_wire_v2(wire, product, format);
     }
@@ -531,6 +592,33 @@ fn decode_derived_wire(
         return decode_derived_wire_v1(wire, product, format);
     }
     Err("invalid derived wire magic")
+}
+
+fn decode_derived_wire_v3(
+    wire: Bytes,
+    product: DerivedProduct,
+    format: RequestedTileFormat,
+) -> Result<DerivedOutcome, &'static str> {
+    let status_offset = DERIVED_WIRE_MAGIC_V3.len();
+    match wire[status_offset] {
+        DERIVED_WIRE_ABSENT if wire.len() == status_offset + 1 => Ok(DerivedOutcome::Absent),
+        DERIVED_WIRE_ABSENT => Err("absent derived wire response has a payload"),
+        status @ (DERIVED_WIRE_TILE | DERIVED_WIRE_DEGRADED) if wire.len() >= status_offset + 3 => {
+            let tile = TileData {
+                bytes: wire.slice(status_offset + 3..),
+                content_type: derived_content_type(wire[status_offset + 1])?,
+                content_encoding: derived_content_encoding(wire[status_offset + 2])?,
+            };
+            let tile = validate_derived_tile_data(product, format, tile)?;
+            Ok(if status == DERIVED_WIRE_DEGRADED {
+                DerivedOutcome::Degraded(tile)
+            } else {
+                DerivedOutcome::Tile(tile)
+            })
+        }
+        DERIVED_WIRE_TILE | DERIVED_WIRE_DEGRADED => Err("derived tile wire response is truncated"),
+        _ => Err("invalid derived wire status"),
+    }
 }
 
 fn decode_derived_wire_v2(
@@ -692,29 +780,35 @@ async fn generate_tile(
     x: u32,
     y: u32,
 ) -> Result<DerivedOutcome, HttpError> {
+    // Admitted *before* the neighborhood fetch: from here to the end of
+    // generation this pipeline may retain up to nine decoded DEM tiles, so the
+    // number of such pipelines — not just running CPU work — stays bounded.
+    // Requests beyond the shed ceiling get 503 instead of queueing memory.
+    let pipeline_permit = state.admit_terrain_pipeline().await?;
     let fetch_started = std::time::Instant::now();
-    let tiles = fetch_neighborhood(&state, tileset_id.clone(), z, x, y).await?;
+    let (tiles, degraded) = fetch_neighborhood(&state, tileset_id.clone(), z, x, y).await?;
     let fetch_elapsed = fetch_started.elapsed();
 
-    // An absent center DEM is authoritative and stable — there is no terrain to
-    // derive here. Return `Absent` so the caller caches it and serves a
-    // cacheable 404, instead of re-running the 3x3 fetch on every request.
+    // An absent center DEM authoritatively means there is no terrain for this
+    // lookup. Return the short-lived `Absent` result instead of regenerating the
+    // 3x3 fetch on every request; source-negative expiry permits later healing.
     if tiles[CENTER_INDEX].is_none() {
         return Ok(DerivedOutcome::Absent);
     }
     let present_sources = tiles.iter().filter(|tile| tile.is_some()).count() as u32;
 
-    // Admit CPU work only around the actual generation — never across the
-    // neighborhood fetch above — so slow object-store/peer I/O cannot hold a
-    // CPU-concurrency slot while doing no CPU work. Admission sheds with 503
-    // under extreme overload rather than growing the queue without bound.
-    let generation_permit = state.admit_cpu_work("terrain_generate").await?;
+    // Acquire CPU execution only around generation — never across source I/O.
+    // The parent pipeline already passed bounded admission, so this child stage
+    // waits for shared concurrency without reserving another in-flight slot.
+    let generation_permit = state.acquire_admitted_cpu_work("terrain_generate").await?;
     let metrics = state.metrics.clone();
     tokio::task::spawn_blocking(move || {
-        // Keep the permit inside the blocking task. Dropping the HTTP future
-        // cannot cancel spawn_blocking, so releasing it earlier would let
-        // disconnected clients exceed the configured CPU concurrency.
+        // Keep the permits inside the blocking task. Dropping the HTTP future
+        // cannot cancel spawn_blocking, so releasing them earlier would let
+        // disconnected clients exceed the configured CPU concurrency (and the
+        // pipeline's retained-neighborhood bound).
         let _generation_permit = generation_permit;
+        let _pipeline_permit = pipeline_permit;
         let cpu_started = std::time::Instant::now();
         let neighborhood = dem::DemNeighborhood::from_tiles(tiles).map_err(|error| {
             (
@@ -775,13 +869,22 @@ async fn generate_tile(
             present_sources,
             generate_ms = generate_elapsed.as_millis() as u64,
             payload_bytes = payload.len(),
+            degraded,
             "generated terrain tile"
         );
-        Ok(DerivedOutcome::Tile(TileData {
+        let tile = TileData {
             bytes,
             content_type,
             content_encoding,
-        }))
+        };
+        // A tile built with an edge fallback after a transient neighbor error
+        // or mutable in-world absence is served, but cached briefly so the seam
+        // heals on regeneration instead of persisting until eviction.
+        Ok(if degraded {
+            DerivedOutcome::Degraded(tile)
+        } else {
+            DerivedOutcome::Tile(tile)
+        })
     })
     .await
     .map_err(|error| {
@@ -801,33 +904,37 @@ const CENTER_INDEX: usize = 4;
 /// per source tile across concurrent derived requests (sibling products and
 /// adjacent derived tiles share six of nine sources).
 ///
-/// Only the center is required. A missing *non-center* source — absent, or a
-/// transient fetch error — degrades to an edge fallback rather than failing the
-/// whole tile. A transient error on the *center* propagates as `Err`, so it is
-/// never cached as a permanent absence.
+/// Only the center is required. A missing in-world *non-center* source — absent
+/// or a transient fetch error — degrades to an edge fallback rather than failing
+/// the whole tile. It also makes the derived result refreshable because both
+/// source-negative caches and transient failures can change. A structural
+/// neighbor beyond the world's Y range is clean and cannot later appear. A
+/// transient error on the *center* propagates as `Err`; center absence becomes
+/// `DerivedOutcome::Absent` in the caller.
 async fn fetch_neighborhood(
     state: &AppState,
     tileset_id: TilesetId,
     z: u8,
     x: u32,
     y: u32,
-) -> Result<[Option<std::sync::Arc<dem::DemTile>>; 9], HttpError> {
+) -> Result<([Option<std::sync::Arc<dem::DemTile>>; 9], bool), HttpError> {
     let world = 1_i64 << z;
     let mut tasks = JoinSet::new();
+    let mut degraded = false;
     let mut tiles: [Option<std::sync::Arc<dem::DemTile>>; 9] = std::array::from_fn(|_| None);
     for dy in -1_i64..=1 {
         for dx in -1_i64..=1 {
-            let index = ((dy + 1) * 3 + dx + 1) as usize;
-            let neighbor_y = i64::from(y) + dy;
-            if !(0..world).contains(&neighbor_y) {
+            let Some((index, neighbor_x, neighbor_y)) =
+                neighborhood_coordinate(world, x, y, dx, dy)
+            else {
+                // Structural absence beyond the world's Y range is not
+                // refreshable and therefore does not degrade the result.
                 continue;
-            }
-            let neighbor_x = (i64::from(x) + dx).rem_euclid(world) as u32;
+            };
             let state = state.clone();
             let tileset_id = tileset_id.clone();
             tasks.spawn(async move {
-                let result =
-                    load_decoded_dem(&state, tileset_id, z, neighbor_x, neighbor_y as u32).await;
+                let result = load_decoded_dem(&state, tileset_id, z, neighbor_x, neighbor_y).await;
                 (index, result)
             });
         }
@@ -841,7 +948,12 @@ async fn fetch_neighborhood(
             )
         })?;
         match result {
-            Ok(tile) => tiles[index] = tile,
+            Ok(tile) => {
+                if tile.is_none() && in_world_absence_is_refreshable(index) {
+                    degraded = true;
+                }
+                tiles[index] = tile;
+            }
             Err(error) => {
                 if index != CENTER_INDEX {
                     debug!(
@@ -852,12 +964,33 @@ async fn fetch_neighborhood(
                         error = %error.1,
                         "neighbor DEM source failed; using edge fallback"
                     );
+                    degraded = true;
                 }
                 tiles[index] = tolerate_neighbor_failure(index, error)?;
             }
         }
     }
-    Ok(tiles)
+    Ok((tiles, degraded))
+}
+
+fn neighborhood_coordinate(
+    world: i64,
+    x: u32,
+    y: u32,
+    dx: i64,
+    dy: i64,
+) -> Option<(usize, u32, u32)> {
+    let neighbor_y = i64::from(y) + dy;
+    if !(0..world).contains(&neighbor_y) {
+        return None;
+    }
+    let index = ((dy + 1) * 3 + dx + 1) as usize;
+    let neighbor_x = (i64::from(x) + dx).rem_euclid(world) as u32;
+    Some((index, neighbor_x, neighbor_y as u32))
+}
+
+fn in_world_absence_is_refreshable(index: usize) -> bool {
+    index != CENTER_INDEX
 }
 
 fn tolerate_neighbor_failure<T>(index: usize, error: HttpError) -> Result<Option<T>, HttpError> {
@@ -871,7 +1004,9 @@ fn tolerate_neighbor_failure<T>(index: usize, error: HttpError) -> Result<Option
 /// Loads and decodes a single source DEM tile, single-flighting the fetch +
 /// WebP decode per source tile id so concurrent derived requests sharing a
 /// source only do it once. Absent sources are cached as `None` (bounded by the
-/// DEM cache's negative TTL); transient errors are not cached.
+/// DEM cache's negative TTL); transient errors are not cached. Decode is child
+/// work of an admitted terrain pipeline, so it queues for CPU concurrency
+/// without independently shedding against the top-level in-flight ceiling.
 async fn load_decoded_dem(
     state: &AppState,
     tileset_id: TilesetId,
@@ -899,10 +1034,10 @@ async fn load_decoded_dem(
                     ),
                 ));
             }
-            // Fetch first, then admit CPU work only for WebP decoding. This uses
-            // the same bounded CPU pool (and shed) as product generation without
-            // ever holding a slot across object-store or peer I/O.
-            let decode_permit = state.admit_cpu_work("dem_decode").await?;
+            // Fetch first, then acquire child CPU execution only for WebP
+            // decoding. The admitted parent bounds this work while the shared
+            // semaphore serializes it at low concurrency without self-shedding.
+            let decode_permit = state.acquire_admitted_cpu_work("dem_decode").await?;
             let decoded = tokio::task::spawn_blocking(move || {
                 let _decode_permit = decode_permit;
                 dem::decode_terrarium(raw.bytes.as_ref())
@@ -951,18 +1086,57 @@ async fn fetch_source_tile(
     Ok(tile)
 }
 
-/// Builds a cacheable `404` for a derived tile whose center DEM is absent. The
-/// short `max-age` (the derived negative TTL) lets the CDN and clients absorb
-/// repeat requests for no-data regions, while still surfacing a later-provisioned
-/// detail archive once the entry expires.
-fn absent_derived_response(negative_ttl: std::time::Duration) -> Response {
-    let mut response = (StatusCode::NOT_FOUND, "derived tile not available\n").into_response();
-    if let Ok(value) =
-        header::HeaderValue::from_str(&format!("public, max-age={}", negative_ttl.as_secs()))
-    {
+fn short_derived_cache_control(negative_ttl: std::time::Duration) -> Option<HeaderValue> {
+    HeaderValue::from_str(&format!(
+        "public, max-age={}, s-maxage={}",
+        negative_ttl.as_secs(),
+        negative_ttl.as_secs()
+    ))
+    .ok()
+}
+
+fn degraded_derived_response(tile: TileData, negative_ttl: std::time::Duration) -> Response {
+    let mut response = tile_data_response(tile);
+    if let Some(value) = short_derived_cache_control(negative_ttl) {
         response.headers_mut().insert(header::CACHE_CONTROL, value);
     }
     response
+}
+
+/// Builds a cacheable `404` for a derived tile whose center DEM is absent. The
+/// short browser and shared-cache lifetime lets repeated no-data requests be
+/// absorbed while still surfacing a later-provisioned detail archive.
+fn absent_derived_response(negative_ttl: std::time::Duration) -> Response {
+    let mut response = (StatusCode::NOT_FOUND, "derived tile not available\n").into_response();
+    if let Some(value) = short_derived_cache_control(negative_ttl) {
+        response.headers_mut().insert(header::CACHE_CONTROL, value);
+    }
+    response
+}
+
+async fn uncached_derived_mlt_response_bytes(
+    state: &AppState,
+    tile: TileData,
+) -> Result<(Bytes, Option<&'static str>), HttpError> {
+    if tile.content_type != TileType::Mvt.content_type() {
+        return Err((
+            StatusCode::NOT_ACCEPTABLE,
+            format!("cannot serve {} tile as MLT", tile.content_type),
+        ));
+    }
+    let permit = state.admit_transcode_work().await?;
+    let bytes = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        transcode_mlt(tile)
+    })
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("MLT transcode task failed: {error}"),
+        )
+    })??;
+    Ok((bytes, Some("gzip")))
 }
 
 fn gzip(data: &[u8]) -> Result<Vec<u8>, HttpError> {
@@ -1145,13 +1319,135 @@ mod tests {
     }
 
     #[test]
-    fn absent_response_is_short_lived_and_cacheable() {
-        let response = absent_derived_response(std::time::Duration::from_secs(60));
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    fn refreshable_responses_have_short_browser_and_shared_cache_lifetimes() {
+        let absent = absent_derived_response(std::time::Duration::from_secs(60));
+        assert_eq!(absent.status(), StatusCode::NOT_FOUND);
         assert_eq!(
-            response.headers().get(header::CACHE_CONTROL).unwrap(),
-            "public, max-age=60"
+            absent.headers().get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=60, s-maxage=60"
+        );
+
+        let degraded = degraded_derived_response(
+            TileData {
+                bytes: Bytes::from_static(b"tile"),
+                content_type: TileType::Mvt.content_type(),
+                content_encoding: Some("gzip"),
+            },
+            std::time::Duration::from_secs(45),
+        );
+        let policy = degraded
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(policy, "public, max-age=45, s-maxage=45");
+        assert!(!policy.contains("stale"));
+    }
+
+    #[test]
+    fn raster_tilejson_advertises_the_image_format_not_vectors() {
+        let info = tilejson_test_info();
+        let tileset_id = TilesetId::new_unchecked("mapterhorn/planet");
+
+        for (product, format) in [
+            (DerivedProduct::HillshadeRaster, "webp"),
+            (DerivedProduct::HillshadeWebpLossy, "webp"),
+            (DerivedProduct::HillshadeJpeg, "jpg"),
+        ] {
+            // `wants_mlt: true` must be ignored for image products.
+            let document = derived_tilejson_document(
+                &tileset_id,
+                "https://ishikari.example",
+                &info,
+                product,
+                true,
+                13,
+            );
+            assert_eq!(document["format"], format, "{}", product.path());
+            assert!(
+                document.get("vector_layers").is_none(),
+                "{}",
+                product.path()
+            );
+            assert!(document.get("encoding").is_none(), "{}", product.path());
+            let tiles = document["tiles"][0].as_str().unwrap();
+            assert!(tiles.ends_with("/{z}/{x}/{y}"), "{tiles}");
+        }
+
+        let vector = derived_tilejson_document(
+            &tileset_id,
+            "https://ishikari.example",
+            &info,
+            DerivedProduct::Contours,
+            false,
+            13,
+        );
+        assert_eq!(vector["format"], "pbf");
+        assert_eq!(vector["encoding"], "mvt");
+        assert!(vector["vector_layers"].is_array());
+        assert!(vector["tiles"][0].as_str().unwrap().ends_with(".mvt"));
+    }
+
+    fn tilejson_test_info() -> crate::storage::TilesetInfo {
+        use bytes::BufMut;
+        let mut bytes = bytes::BytesMut::with_capacity(127);
+        bytes.extend_from_slice(b"PMTiles");
+        bytes.put_u8(3);
+        for _ in 0..11 {
+            bytes.put_u64_le(0);
+        }
+        bytes.put_u8(1); // clustered
+        bytes.put_u8(1); // internal compression: none
+        bytes.put_u8(2); // tile compression: gzip
+        bytes.put_u8(1); // tile type: mvt
+        bytes.put_u8(0); // min zoom
+        bytes.put_u8(12); // max zoom
+        bytes.put_i32_le(-1800000000);
+        bytes.put_i32_le(-850000000);
+        bytes.put_i32_le(1800000000);
+        bytes.put_i32_le(850000000);
+        bytes.put_u8(0);
+        bytes.put_i32_le(0);
+        bytes.put_i32_le(0);
+        crate::storage::TilesetInfo {
+            header: crate::pmtiles::Header::parse(bytes.freeze()).expect("header parses"),
+            metadata: std::sync::Arc::new(crate::pmtiles::Metadata::default()),
+        }
+    }
+
+    #[test]
+    fn degraded_tiles_preserve_refreshability_over_the_v3_wire() {
+        let degraded = DerivedOutcome::Degraded(TileData {
+            bytes: Bytes::from_static(b"seamed"),
+            content_type: TileType::Mvt.content_type(),
+            content_encoding: Some("gzip"),
+        });
+        let decoded = decode_derived_wire(
+            encode_derived_wire(&degraded).unwrap(),
+            DerivedProduct::Hillshade,
+            RequestedTileFormat::AsStored,
+        )
+        .unwrap();
+        let DerivedOutcome::Degraded(tile) = decoded else {
+            panic!("degraded wire payload must preserve refreshability");
+        };
+        assert_eq!(tile.bytes, Bytes::from_static(b"seamed"));
+        assert!(
+            encode_derived_wire(&degraded)
+                .unwrap()
+                .starts_with(DERIVED_WIRE_MAGIC_V3)
+        );
+
+        let clean = DerivedOutcome::Tile(TileData {
+            bytes: Bytes::from_static(b"clean"),
+            content_type: TileType::Mvt.content_type(),
+            content_encoding: Some("gzip"),
+        });
+        assert!(
+            encode_derived_wire(&clean)
+                .unwrap()
+                .starts_with(DERIVED_WIRE_MAGIC_V2)
         );
     }
 
@@ -1167,5 +1463,21 @@ mod tests {
             tolerate_neighbor_failure::<()>(CENTER_INDEX, error.clone()).unwrap_err(),
             error
         );
+    }
+
+    #[test]
+    fn only_in_world_non_center_absence_is_refreshable() {
+        assert!(in_world_absence_is_refreshable(0));
+        assert!(!in_world_absence_is_refreshable(CENTER_INDEX));
+
+        let world = 4;
+        assert!(
+            neighborhood_coordinate(world, 0, 0, 0, -1).is_none(),
+            "neighbor beyond the north edge is structural"
+        );
+        let (index, wrapped_x, neighbor_y) =
+            neighborhood_coordinate(world, 0, 1, -1, 0).expect("in-world neighbor");
+        assert_eq!((index, wrapped_x, neighbor_y), (3, 3, 1));
+        assert!(in_world_absence_is_refreshable(index));
     }
 }

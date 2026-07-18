@@ -21,10 +21,10 @@ use crate::{
         AppState, HttpError, apply_origin_vary, bytes_response, cache,
         conditional::Validators,
         get_origin,
-        provider::{ProviderConfig, path_percent_encode_segments},
+        provider::{ProviderConfig, path_percent_encode_segments, provider_routing_key},
         sprite,
         tileset::render_preview_html,
-        upstream::{ProviderResource, fetch_limited_json},
+        upstream::{ProviderResource, fetch_limited_json, route_or_fetch_provider},
     },
 };
 
@@ -66,9 +66,7 @@ pub(crate) async fn internal_style_handler(
         state
             .metrics
             .add_internal_bytes(resource.bytes().len() as u64);
-        let mut response = bytes_response(resource.bytes().clone(), "application/json", None);
-        resource.apply_internal_headers(response.headers_mut());
-        return Ok(response);
+        return Ok(resource.verbatim_internal_response("application/json"));
     }
     if let Some((style_key, suffix)) = sprite::parse_sprite_path(&style_path) {
         return sprite::serve_sprite_local(state, style_key, suffix).await;
@@ -100,26 +98,52 @@ async fn serve_style(
     validate_style_key(&style_key)?;
     let upstream = resolve_style_url(&state, &style_key)?;
     let resource = route_style_bytes(&state, &style_key, &upstream).await?;
-    let decoded = resource.decoded_bytes(MAX_STYLE_BYTES, "style")?;
-    let mut style: Value = serde_json::from_slice(&decoded).map_err(|error| {
-        (
-            StatusCode::BAD_GATEWAY,
-            format!("style JSON invalid: {error}"),
-        )
-    })?;
-    rewrite_style(
-        &mut style,
-        &get_origin(&headers),
-        &style_key,
-        &state.provider,
-        encoding,
-    );
-    let body = serde_json::to_vec(&style).map_err(|error| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("style JSON serialization failed: {error}"),
-        )
-    })?;
+    // Decode, parse, rewrite, and serialize are CPU-heavy for a large style
+    // and would otherwise run on Tokio workers on every request (the body is
+    // often cached, so the fetch admission bound does not cover this work).
+    // Run it on the blocking pool under the light provider admission:
+    // isolated from the terrain/MLT pool so heavy generation can never shed
+    // provider documents.
+    let permit = state.admit_provider_work("style_rewrite").await?;
+    let body = {
+        let resource = resource.clone();
+        let provider = state.provider.clone();
+        let origin = get_origin(&headers);
+        let style_key = style_key.clone();
+        let encoding = encoding.map(str::to_owned);
+        tokio::task::spawn_blocking(move || -> Result<Vec<u8>, HttpError> {
+            // Keep the permit inside the blocking task: dropping the HTTP
+            // future cannot cancel spawn_blocking.
+            let _permit = permit;
+            let decoded = resource.decoded_bytes(MAX_STYLE_BYTES, "style")?;
+            let mut style: Value = serde_json::from_slice(&decoded).map_err(|error| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!("style JSON invalid: {error}"),
+                )
+            })?;
+            rewrite_style(
+                &mut style,
+                &origin,
+                &style_key,
+                &provider,
+                encoding.as_deref(),
+            );
+            serde_json::to_vec(&style).map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("style JSON serialization failed: {error}"),
+                )
+            })
+        })
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("style rewrite task failed: {error}"),
+            )
+        })??
+    };
     // The body is a derived representation (origin/encoding-dependent rewrite),
     // so the upstream `ETag` does not identify it. Hash the exact bytes served
     // instead; this also changes whenever the rewrite logic itself changes.
@@ -149,25 +173,19 @@ async fn route_style_bytes(
     style_key: &str,
     upstream: &str,
 ) -> Result<ProviderResource, HttpError> {
-    let key = format!("style:{upstream}");
+    let key = provider_routing_key("style", upstream);
     let path = format!(
         "/_internal/provider/styles/{}/style.json",
         path_percent_encode_segments(style_key)
     );
-    if let Some(response) = state
-        .resource_resolver
-        .route_provider_resource(&key, &path, "style")
-        .await
-        .map_err(|error| {
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("style peer route failed: {error}"),
-            )
-        })?
-    {
-        return Ok(ProviderResource::from_peer(response));
-    }
-    fetch_style_bytes_local(state, upstream.to_string()).await
+    route_or_fetch_provider(
+        state,
+        &key,
+        &path,
+        "style",
+        fetch_style_bytes_local(state, upstream.to_string()),
+    )
+    .await
 }
 
 async fn fetch_style_bytes_local(

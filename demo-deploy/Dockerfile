@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.7
+
 # Release image for Ishikari (pure Rust: PMTiles + HTTP).
 #
 # glibc build on distroless/cc: mature malloc and DNS behave well under high QPS
@@ -24,7 +26,9 @@ COPY ishikari-terrain/Cargo.toml ishikari-terrain/Cargo.toml
 COPY ishikari/src ishikari/src
 COPY ishikari-sim/src ishikari-sim/src
 COPY ishikari-terrain/src ishikari-terrain/src
-RUN cargo build --release --locked -p ishikari \
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    cargo build --release --locked -p ishikari \
     && cp target/release/ishikari /ishikari
 
 FROM gcr.io/distroless/cc-debian13:nonroot

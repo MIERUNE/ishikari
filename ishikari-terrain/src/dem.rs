@@ -7,8 +7,16 @@ use image::ImageFormat;
 
 const MIN_VALID_ELEVATION: f32 = -12_000.0;
 const MAX_VALID_ELEVATION: f32 = 9_000.0;
-/// Maximum accepted DEM source-tile edge (px). Real tiles are 256/512.
-const MAX_DEM_TILE_DIM: u32 = 2048;
+/// Maximum supported DEM source-tile edge (px). Mapterhorn Terrarium sources
+/// are 256px or 512px; accepting larger inputs would multiply decode,
+/// neighborhood, contour, and hillshade memory without a supported use case.
+const MAX_DEM_TILE_DIM: u32 = 512;
+const MAX_DEM_TILE_PIXELS: usize = MAX_DEM_TILE_DIM as usize * MAX_DEM_TILE_DIM as usize;
+/// Maximum retained decoded bytes represented by a complete 3x3 neighborhood.
+/// Decoder temporaries and generated-product buffers are separate, short-lived
+/// allocations bounded by CPU concurrency.
+pub const MAX_DEM_NEIGHBORHOOD_BYTES: usize =
+    9 * (MAX_DEM_TILE_PIXELS * std::mem::size_of::<f32>() + std::mem::size_of::<DemTile>());
 
 #[derive(Debug)]
 pub struct DemTile {
@@ -47,6 +55,12 @@ impl DemNeighborhood {
         if width < 3 || height < 3 {
             bail!("DEM tile is too small: {width}x{height}");
         }
+        // Decode enforces this for external inputs; retain a defense-in-depth
+        // invariant here for synthetic or future programmatic callers.
+        if width != height {
+            bail!("DEM tile is not square: {width}x{height}");
+        }
+        let mut retained_bytes = 0usize;
         for tile in tiles.iter().flatten() {
             if tile.width != width || tile.height != height {
                 bail!(
@@ -55,6 +69,25 @@ impl DemNeighborhood {
                     tile.height
                 );
             }
+            let expected_pixels = tile
+                .width
+                .checked_mul(tile.height)
+                .context("DEM tile dimensions overflow")?;
+            if tile.elevations.len() != expected_pixels {
+                bail!(
+                    "DEM tile sample count differs: expected {expected_pixels}, got {}",
+                    tile.elevations.len()
+                );
+            }
+            retained_bytes = retained_bytes
+                .checked_add(tile.byte_size())
+                .context("DEM neighborhood byte size overflow")?;
+        }
+        if retained_bytes > MAX_DEM_NEIGHBORHOOD_BYTES {
+            bail!(
+                "DEM neighborhood exceeds the {}-byte decoded budget: {retained_bytes}",
+                MAX_DEM_NEIGHBORHOOD_BYTES
+            );
         }
         Ok(Self {
             tiles,
@@ -126,20 +159,29 @@ fn tile_axis(value: i32, size: i32) -> (i32, i32) {
 }
 
 pub fn decode_terrarium(bytes: &[u8]) -> Result<DemTile> {
-    // Cap decode dimensions so a crafted WebP declaring huge dimensions cannot
-    // expand a tiny payload into a multi-gigabyte buffer. Real DEM source tiles
-    // are 256/512 px; the bound leaves generous headroom.
+    // Cap decode dimensions so a crafted WebP cannot expand a small payload
+    // beyond the supported 256/512px source contract.
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes));
     reader.set_format(ImageFormat::WebP);
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MAX_DEM_TILE_DIM);
     limits.max_image_height = Some(MAX_DEM_TILE_DIM);
+    // Defense in depth for decoder implementations that honor the non-strict
+    // allocation limit. Strict dimensions remain the primary memory bound.
+    limits.max_alloc = Some(16 * 1024 * 1024);
     reader.limits(limits);
-    let image = reader
-        .decode()
-        .context("decode Mapterhorn WebP")?
-        .into_rgb8();
-    let (width, height) = image.dimensions();
+    let image = reader.decode().context("decode Mapterhorn WebP")?;
+    let (width, height) = (image.width(), image.height());
+    if width != height {
+        bail!("DEM tile is not square: {width}x{height}");
+    }
+    let pixels = (width as usize)
+        .checked_mul(height as usize)
+        .context("DEM tile dimensions overflow")?;
+    if pixels > MAX_DEM_TILE_PIXELS {
+        bail!("DEM tile exceeds the supported pixel budget: {width}x{height}");
+    }
+    let image = image.into_rgb8();
     let elevations = image
         .pixels()
         .map(|pixel| {
@@ -222,5 +264,44 @@ mod tests {
         let neighborhood = DemNeighborhood::from_tiles(tiles).unwrap();
         assert_eq!(neighborhood.get(3, 1), 1.0);
         assert_eq!(neighborhood.get(-1, 1), 0.0);
+    }
+
+    #[test]
+    fn rejects_rectangular_dem_tiles_during_decode() {
+        // Reject before the malformed tile can enter the decoded-DEM cache.
+        for (width, height) in [(8, 3), (3, 8)] {
+            let error = decode_terrarium(&webp_tile([128, 0, 0], width, height)).unwrap_err();
+            assert!(error.to_string().contains("not square"), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn decodes_the_maximum_supported_edge() {
+        let tile = decode_terrarium(&webp_tile([128, 0, 0], MAX_DEM_TILE_DIM, MAX_DEM_TILE_DIM))
+            .expect("maximum supported DEM");
+        assert_eq!(tile.width, MAX_DEM_TILE_DIM as usize);
+        assert_eq!(tile.elevations.len(), MAX_DEM_TILE_PIXELS);
+    }
+
+    #[test]
+    fn rejects_dem_tiles_larger_than_the_supported_edge() {
+        let oversized = MAX_DEM_TILE_DIM + 1;
+        let error = decode_terrarium(&webp_tile([128, 0, 0], oversized, oversized)).unwrap_err();
+        assert!(
+            error.to_string().contains("decode Mapterhorn WebP"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn maximum_supported_neighborhood_fits_the_aggregate_budget() {
+        let tile = Arc::new(DemTile {
+            width: MAX_DEM_TILE_DIM as usize,
+            height: MAX_DEM_TILE_DIM as usize,
+            elevations: vec![0.0; MAX_DEM_TILE_PIXELS],
+        });
+        let tiles = std::array::from_fn(|_| Some(tile.clone()));
+        let neighborhood = DemNeighborhood::from_tiles(tiles).expect("maximum neighborhood");
+        assert_eq!(neighborhood.width(), MAX_DEM_TILE_DIM as usize);
     }
 }

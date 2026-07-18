@@ -299,6 +299,12 @@ impl Membership {
 fn collect_live_peers_from_nodes(live_nodes: &BTreeMap<ChitchatId, NodeState>) -> Vec<Peer> {
     let mut peers: Vec<_> = live_nodes
         .iter()
+        // Chitchat's `live_nodes()` is phi-detector-only. The configured
+        // `extra_liveness_predicate` is applied to its watcher payload, but not
+        // to direct iterator reads, so enforce the routing predicate here too.
+        // This also keeps callers correct if they are handed an unfiltered
+        // snapshot in the future.
+        .filter(|(_, node_state)| node_state.get(DRAINING_KEY) != Some("true"))
         .map(|(peer_id, node_state)| Peer {
             id: peer_id.node_id.to_string(),
             addr: peer_http_addr(peer_id, node_state),
@@ -324,4 +330,30 @@ fn peer_http_addr(peer_id: &ChitchatId, node_state: &NodeState) -> SocketAddr {
         .and_then(|port| port.parse::<u16>().ok())
         .unwrap_or(DEFAULT_HTTP_PORT);
     SocketAddr::new(peer_id.gossip_advertise_addr.ip(), http_port)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(id: &str, port: u16, draining: bool) -> (ChitchatId, NodeState) {
+        let chitchat_id = ChitchatId::new(id, 1, ([127, 0, 0, 1], port).into());
+        let mut state = NodeState::for_test();
+        state.set(HTTP_ADVERTISE_ADDR_KEY, format!("127.0.0.1:{port}"));
+        state.set(DRAINING_KEY, draining.to_string());
+        (chitchat_id, state)
+    }
+
+    #[test]
+    fn routing_snapshot_excludes_draining_nodes_even_when_input_is_unfiltered() {
+        let active = node("active", 9001, false);
+        let draining = node("draining", 9002, true);
+        let nodes = BTreeMap::from([active, draining]);
+
+        let peers = collect_live_peers_from_nodes(&nodes);
+
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].id, "active");
+        assert_eq!(peers[0].addr, "127.0.0.1:9001".parse().unwrap());
+    }
 }

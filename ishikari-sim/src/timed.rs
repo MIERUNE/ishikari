@@ -17,6 +17,9 @@ use crate::{
     viewport_batch_ranges,
 };
 
+const MAX_TIMED_STEP_WORK_PER_USER: u64 = 1_000_000;
+const MAX_TIMED_STEP_WORK_TOTAL: u64 = 10_000_000;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TimedConfig {
     pub think_time_ms: u64,
@@ -63,6 +66,7 @@ pub struct TimedReport {
 
 struct PreparedBatch {
     step: u64,
+    think_delay_before: Duration,
     requests: Vec<PreparedRequest>,
 }
 
@@ -121,15 +125,15 @@ pub async fn run_timed_trace(
         "request timeout must be positive"
     );
 
-    let batches = prepare_user_batches(cluster, entries)?;
+    let batches = prepare_user_batches(cluster, entries, &config)?;
     let tracker = Arc::new(InflightTracker::new(cluster.node_count()));
     let started_at = Instant::now();
     let mut users = JoinSet::new();
 
-    for (user, batches) in batches {
+    for batches in batches.into_values() {
         let tracker = tracker.clone();
         let config = config.clone();
-        users.spawn(run_user(user, batches, config, tracker));
+        users.spawn(run_user(batches, config, tracker));
     }
 
     let mut records = Vec::with_capacity(entries.len());
@@ -186,6 +190,7 @@ pub async fn run_timed_trace(
 fn prepare_user_batches(
     cluster: &SimCluster,
     entries: &[TraceEntry],
+    config: &TimedConfig,
 ) -> Result<BTreeMap<usize, Vec<PreparedBatch>>> {
     let mut users: BTreeMap<usize, Vec<PreparedBatch>> = BTreeMap::new();
     for range in viewport_batch_ranges(entries)? {
@@ -197,31 +202,73 @@ fn prepare_user_batches(
             .collect::<Result<Vec<_>>>()?;
         users.entry(first.user).or_default().push(PreparedBatch {
             step: first.step,
+            think_delay_before: Duration::ZERO,
             requests,
         });
     }
-    for batches in users.values_mut() {
+    let mut global_step_work = 0_u64;
+    for (&user, batches) in &mut users {
         batches.sort_by_key(|batch| batch.step);
+        prepare_think_delays(user, batches, config, &mut global_step_work)?;
     }
     Ok(users)
 }
 
-async fn run_user(
+fn prepare_think_delays(
     user: usize,
+    batches: &mut [PreparedBatch],
+    config: &TimedConfig,
+    global_step_work: &mut u64,
+) -> Result<()> {
+    let mut previous_step = None;
+    let mut user_step_work = 0_u64;
+    for batch in batches {
+        let Some(step) = previous_step else {
+            previous_step = Some(batch.step);
+            continue;
+        };
+        let transition_work = batch
+            .step
+            .checked_sub(step)
+            .context("timed trace step transition underflow")?;
+        user_step_work = user_step_work
+            .checked_add(transition_work)
+            .context("timed per-user step work overflow")?;
+        ensure!(
+            user_step_work <= MAX_TIMED_STEP_WORK_PER_USER,
+            "timed trace user {user} expands to {user_step_work} step transitions, exceeding {MAX_TIMED_STEP_WORK_PER_USER}"
+        );
+        *global_step_work = global_step_work
+            .checked_add(transition_work)
+            .context("timed global step work overflow")?;
+        ensure!(
+            *global_step_work <= MAX_TIMED_STEP_WORK_TOTAL,
+            "timed trace expands to {} step transitions, exceeding {MAX_TIMED_STEP_WORK_TOTAL}",
+            *global_step_work
+        );
+
+        batch.think_delay_before =
+            (step..batch.step).try_fold(Duration::ZERO, |total, iteration| {
+                total
+                    .checked_add(think_time(config, user, iteration))
+                    .context("timed think duration overflow")
+            })?;
+        previous_step = Some(batch.step);
+    }
+    Ok(())
+}
+
+async fn run_user(
     batches: Vec<PreparedBatch>,
     config: TimedConfig,
     tracker: Arc<InflightTracker>,
 ) -> Result<UserResult> {
     let mut records = Vec::new();
-    let mut previous_step = None;
 
     for batch in batches {
-        if let Some(step) = previous_step {
-            for iteration in step..batch.step {
-                tokio::time::sleep(think_time(&config, user, iteration)).await;
-            }
+        if !batch.think_delay_before.is_zero() {
+            tokio::time::sleep(batch.think_delay_before).await;
         }
-        previous_step = Some(batch.step);
 
         let arrived_at = Instant::now();
         let mut requests = JoinSet::new();
@@ -289,7 +336,7 @@ fn summarize(mut latencies: Vec<Duration>) -> LatencySummary {
         p90_ms: percentile(&latencies, 0.90),
         p95_ms: percentile(&latencies, 0.95),
         p99_ms: percentile(&latencies, 0.99),
-        max_ms: latencies.last().copied().map(duration_ms).unwrap_or(0.0),
+        max_ms: latencies.last().copied().map_or(0.0, duration_ms),
     }
 }
 
@@ -309,7 +356,10 @@ fn duration_ms(duration: Duration) -> f64 {
 mod tests {
     use std::time::Duration;
 
-    use super::{TimedConfig, percentile, run_timed_trace, summarize, think_time};
+    use super::{
+        MAX_TIMED_STEP_WORK_PER_USER, MAX_TIMED_STEP_WORK_TOTAL, PreparedBatch, TimedConfig,
+        percentile, prepare_think_delays, run_timed_trace, summarize, think_time,
+    };
     use crate::{ClusterConfig, SimCluster, TraceEntry};
 
     #[test]
@@ -332,6 +382,46 @@ mod tests {
         assert_eq!(first, think_time(&config, 7, 11));
         assert!(first >= Duration::from_millis(700));
         assert!(first <= Duration::from_millis(1_700));
+    }
+
+    #[test]
+    fn cumulative_step_work_is_bounded_and_think_sleeps_are_aggregated() {
+        let config = TimedConfig::default();
+        let mut batches = vec![
+            PreparedBatch {
+                step: 10,
+                think_delay_before: Duration::ZERO,
+                requests: Vec::new(),
+            },
+            PreparedBatch {
+                step: 13,
+                think_delay_before: Duration::ZERO,
+                requests: Vec::new(),
+            },
+        ];
+        let expected = (10..13).fold(Duration::ZERO, |total, iteration| {
+            total + think_time(&config, 7, iteration)
+        });
+        let mut global = 0;
+        prepare_think_delays(7, &mut batches, &config, &mut global).expect("bounded work");
+        assert_eq!(global, 3);
+        assert_eq!(batches[1].think_delay_before, expected);
+
+        batches[1].step = 10 + MAX_TIMED_STEP_WORK_PER_USER + 1;
+        let error = prepare_think_delays(7, &mut batches, &config, &mut 0)
+            .expect_err("per-user work must be bounded");
+        assert!(error.to_string().contains("user 7"));
+
+        batches[1].step = 11;
+        let mut global = MAX_TIMED_STEP_WORK_TOTAL;
+        let error = prepare_think_delays(7, &mut batches, &config, &mut global)
+            .expect_err("global work must be bounded");
+        assert!(error.to_string().contains("timed trace expands"));
+
+        let mut global = u64::MAX;
+        let error = prepare_think_delays(7, &mut batches, &config, &mut global)
+            .expect_err("global work overflow must fail");
+        assert!(error.to_string().contains("overflow"));
     }
 
     #[tokio::test(start_paused = true)]

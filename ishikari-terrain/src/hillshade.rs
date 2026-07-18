@@ -257,6 +257,11 @@ pub fn generate(neighborhood: &DemNeighborhood, zoom: u8, tile_y: u32) -> Result
 pub const SHADE_CODE_SCALE: f64 = 5.0;
 
 fn shade_byte(code: f64) -> u8 {
+    // Nodata reaches this as NaN; `clamp` propagates NaN and `as u8` casts it
+    // to 0 (an extreme shadow byte). Nodata must render as the neutral 128.
+    if code.is_nan() {
+        return 128;
+    }
     (128.0 + code * SHADE_CODE_SCALE).round().clamp(0.0, 255.0) as u8
 }
 
@@ -1094,5 +1099,13 @@ mod tests {
             }
         }
         assert!(compared > 0);
+    }
+
+    #[test]
+    fn nodata_shade_bytes_are_neutral_not_black() {
+        assert_eq!(shade_byte(f64::NAN), 128);
+        assert_eq!(shade_byte(0.0), 128);
+        assert_eq!(shade_byte(-1_000.0), 0);
+        assert_eq!(shade_byte(1_000.0), 255);
     }
 }

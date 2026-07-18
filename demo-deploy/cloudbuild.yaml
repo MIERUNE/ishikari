@@ -1,11 +1,22 @@
 substitutions:
   _IMAGE: asia-northeast1-docker.pkg.dev/mappf-experiment/ishikari/ishikari:dev
+  _CACHE_IMAGE: asia-northeast1-docker.pkg.dev/mappf-experiment/ishikari/ishikari-buildcache:latest
 options:
   machineType: E2_HIGHCPU_8
   diskSizeGb: 30
 timeout: 1800s
 steps:
   - name: gcr.io/cloud-builders/docker
-    env: [DOCKER_BUILDKIT=1]
-    args: [build, -f, demo-deploy/Dockerfile, -t, "${_IMAGE}", .]
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        docker buildx create --driver docker-container --use --name ishikari-builder
+        docker buildx build \
+          --file demo-deploy/Dockerfile \
+          --tag "${_IMAGE}" \
+          --cache-from "type=registry,ref=${_CACHE_IMAGE}" \
+          --cache-to "type=registry,ref=${_CACHE_IMAGE},mode=max,oci-mediatypes=true,image-manifest=true" \
+          --load \
+          .
 images: ["${_IMAGE}"]

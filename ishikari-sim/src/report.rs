@@ -18,7 +18,11 @@ pub struct SimReport {
     pub backend_bytes: u64,
     pub tile_cache_bytes: u64,
     pub chunk_cache_bytes: u64,
+    /// Positive tile-body hits in the entry node's L1 cache. Negative-cache
+    /// hits are counted separately so every execution mode (in-process,
+    /// modeled, HTTP replay) reports the same semantics.
     pub l1_cache_hits: u64,
+    pub negative_cache_hits: u64,
     pub l1_cache_hit_rate: f64,
     pub cache_hit_rate: f64,
     pub peer_forward_rate: f64,
@@ -31,22 +35,21 @@ pub struct SimReport {
 
 impl SimReport {
     pub(crate) fn finalize_derived_metrics(&mut self) {
-        if self.requests > 0 {
-            self.l1_cache_hit_rate = self.l1_cache_hits as f64 / self.requests as f64;
-            self.cache_hit_rate = (self.source_count("self_cache")
-                + self.source_count("peer_cache")) as f64
-                / self.requests as f64;
-            self.peer_forward_rate = (self.source_count("peer_cache")
-                + self.source_count("peer_backend")) as f64
-                / self.requests as f64;
+        let (request_rates, read_amplification) = calculate_derived_rates(
+            self.requests,
+            self.served_bytes,
+            self.backend_bytes,
+            self.l1_cache_hits,
+            &self.by_source,
+        );
+        if let Some((l1, cache, peer)) = request_rates {
+            self.l1_cache_hit_rate = l1;
+            self.cache_hit_rate = cache;
+            self.peer_forward_rate = peer;
         }
-        if self.served_bytes > 0 {
-            self.read_amplification = self.backend_bytes as f64 / self.served_bytes as f64;
+        if let Some(read_amplification) = read_amplification {
+            self.read_amplification = read_amplification;
         }
-    }
-
-    fn source_count(&self, source: &str) -> u64 {
-        self.by_source.get(source).copied().unwrap_or(0)
     }
 
     pub(crate) fn set_histograms(&mut self, histograms: &NodeHistogramSnapshot) {
@@ -56,6 +59,26 @@ impl SimReport {
     pub(crate) fn set_node_request_load(&mut self) {
         self.node_request_load = NodeRequestLoadReport::from_nodes(&self.nodes);
     }
+}
+
+pub(crate) fn calculate_derived_rates(
+    requests: u64,
+    served_bytes: u64,
+    backend_bytes: u64,
+    l1_cache_hits: u64,
+    by_source: &BTreeMap<String, u64>,
+) -> (Option<(f64, f64, f64)>, Option<f64>) {
+    let source = |name| by_source.get(name).copied().unwrap_or(0) as f64;
+    let request_rates = (requests > 0).then(|| {
+        let requests = requests as f64;
+        (
+            l1_cache_hits as f64 / requests,
+            (source("self_cache") + source("peer_cache")) / requests,
+            (source("peer_cache") + source("peer_backend")) / requests,
+        )
+    });
+    let read_amplification = (served_bytes > 0).then(|| backend_bytes as f64 / served_bytes as f64);
+    (request_rates, read_amplification)
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -250,7 +273,11 @@ pub struct ClusterObservation {
     pub membership_extra_peer_refs: usize,
     pub membership_min_peer_count: usize,
     pub membership_max_peer_count: usize,
+    /// Legacy total of positive and negative L1 hits. Report-v2 consumers
+    /// should prefer the two explicit counters below.
     pub cache_hits: u64,
+    pub l1_cache_hits: u64,
+    pub negative_cache_hits: u64,
     pub by_source: BTreeMap<String, u64>,
     pub node_requests: BTreeMap<String, u64>,
     pub peer_requests: u64,
@@ -264,70 +291,29 @@ pub struct ClusterObservation {
     pub chunk_cache_bytes: u64,
 }
 
-pub(crate) fn add_metrics(total: &mut NodeMetricsSnapshot, node: NodeMetricsSnapshot) {
-    total.peer_forward_successes += node.peer_forward_successes;
-    total.peer_forward_not_found += node.peer_forward_not_found;
-    total.peer_forward_retryable += node.peer_forward_retryable;
-    total.peer_forward_fatal += node.peer_forward_fatal;
-    total.peer_forward_backoff_skips += node.peer_forward_backoff_skips;
-    total.peer_tile_fetches += node.peer_tile_fetches;
-    total.peer_bootstrap_fetches += node.peer_bootstrap_fetches;
-    total.peer_leaf_fetches += node.peer_leaf_fetches;
-    total.peer_provider_fetches += node.peer_provider_fetches;
-    total.peer_tile_duplicate_inflight += node.peer_tile_duplicate_inflight;
-    total.peer_bootstrap_duplicate_inflight += node.peer_bootstrap_duplicate_inflight;
-    total.peer_leaf_duplicate_inflight += node.peer_leaf_duplicate_inflight;
-    total.peer_provider_duplicate_inflight += node.peer_provider_duplicate_inflight;
-    total.internal_tile_requests += node.internal_tile_requests;
-    total.internal_bootstrap_requests += node.internal_bootstrap_requests;
-    total.internal_leaf_requests += node.internal_leaf_requests;
-    total.internal_provider_requests += node.internal_provider_requests;
-    total.backend_fetches += node.backend_fetches;
-    total.backend_fetch_successes += node.backend_fetch_successes;
-    total.backend_fetch_not_found += node.backend_fetch_not_found;
-    total.backend_fetch_errors += node.backend_fetch_errors;
-    total.backend_fetch_timeouts += node.backend_fetch_timeouts;
-    total.backend_fetched_chunks += node.backend_fetched_chunks;
-    total.chunk_cache_hits += node.chunk_cache_hits;
-    total.chunk_cache_misses += node.chunk_cache_misses;
-    total.chunk_cache_post_fetch_hits += node.chunk_cache_post_fetch_hits;
-    total.chunk_fetch_queued += node.chunk_fetch_queued;
-    total.chunk_fetch_joined_pending += node.chunk_fetch_joined_pending;
-    total.chunk_fetch_joined_inflight += node.chunk_fetch_joined_inflight;
-    total.chunk_dispatch_immediate += node.chunk_dispatch_immediate;
-    total.chunk_dispatch_window += node.chunk_dispatch_window;
-    total.chunk_dispatch_pending_chunks += node.chunk_dispatch_pending_chunks;
-    total.chunk_waiters_released += node.chunk_waiters_released;
-}
-
-pub(crate) fn add_histograms(total: &mut NodeHistogramSnapshot, node: &NodeHistogramSnapshot) {
-    total.merge(node);
-}
-
 #[cfg(test)]
 mod tests {
     use ishikari::metrics::{HistogramBucketSnapshot, HistogramSnapshot, NodeMetricsSnapshot};
 
-    use super::{DistributionSummary, NodeReport, SimReport, add_metrics};
+    use super::{DistributionSummary, NodeReport, SimReport};
 
     #[test]
     fn aggregates_peer_forward_metrics() {
         let mut total = NodeMetricsSnapshot::default();
-        add_metrics(
-            &mut total,
-            NodeMetricsSnapshot {
-                peer_forward_successes: 7,
-                peer_forward_retryable: 2,
-                peer_forward_backoff_skips: 11,
-                peer_bootstrap_fetches: 3,
-                peer_leaf_fetches: 5,
-                peer_tile_duplicate_inflight: 2,
-                internal_bootstrap_requests: 13,
-                internal_leaf_requests: 17,
-                ..NodeMetricsSnapshot::default()
-            },
-        );
+        total.merge(&NodeMetricsSnapshot {
+            negative_cache_hits: 19,
+            peer_forward_successes: 7,
+            peer_forward_retryable: 2,
+            peer_forward_backoff_skips: 11,
+            peer_bootstrap_fetches: 3,
+            peer_leaf_fetches: 5,
+            peer_tile_duplicate_inflight: 2,
+            internal_bootstrap_requests: 13,
+            internal_leaf_requests: 17,
+            ..NodeMetricsSnapshot::default()
+        });
 
+        assert_eq!(total.negative_cache_hits, 19);
         assert_eq!(total.peer_forward_successes, 7);
         assert_eq!(total.peer_forward_retryable, 2);
         assert_eq!(total.peer_forward_backoff_skips, 11);
@@ -336,6 +322,21 @@ mod tests {
         assert_eq!(total.peer_tile_duplicate_inflight, 2);
         assert_eq!(total.internal_bootstrap_requests, 13);
         assert_eq!(total.internal_leaf_requests, 17);
+    }
+
+    #[test]
+    fn cluster_observation_serializes_explicit_cache_counters() {
+        let observation = super::ClusterObservation {
+            cache_hits: 7,
+            l1_cache_hits: 3,
+            negative_cache_hits: 4,
+            ..super::ClusterObservation::default()
+        };
+
+        let value = serde_json::to_value(observation).expect("serialize observation");
+        assert_eq!(value["cache_hits"], 7);
+        assert_eq!(value["l1_cache_hits"], 3);
+        assert_eq!(value["negative_cache_hits"], 4);
     }
 
     #[test]

@@ -23,7 +23,7 @@ use moka::{policy::EvictionPolicy, sync::Cache};
 use crate::{
     TraceEntry,
     cluster::{ClusterConfig, simulated_peer, simulated_peers},
-    report::{ClusterObservation, NodeReport, SchedulerReport, SimReport, add_metrics},
+    report::{ClusterObservation, NodeReport, SchedulerReport, SimReport},
 };
 
 const MAX_PRODUCTION_CHUNK_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
@@ -226,10 +226,13 @@ impl ModelNode {
     }
 
     fn put_tile(&self, key: TileKey, length: Option<u32>) {
-        let key_bytes = std::mem::size_of::<TilesetId>() + std::mem::size_of::<u64>();
-        let weight = key_bytes
-            .saturating_add(length.unwrap_or_default() as usize)
-            .min(u32::MAX as usize) as u32;
+        // Share the production logical-weight formula (interned id bytes plus a
+        // per-entry floor) so capacity sweeps evict like production instead of
+        // charging negative/small entries only their inline-key bytes.
+        let weight = ishikari::tile_cache_logical_weight(
+            key.tileset_id.as_str(),
+            length.map(|length| length as usize),
+        );
         let value = length.map_or(ModeledTile::NotFound { weight }, |length| {
             ModeledTile::Found { length, weight }
         });
@@ -411,10 +414,11 @@ impl ModeledCluster {
         let key = tile_key(entry)?;
 
         if let Some(cached) = self.nodes[entry_node].tile_cache.get(&key) {
-            self.report.l1_cache_hits += 1;
             let source = if cached.length().is_some() {
+                self.report.l1_cache_hits += 1;
                 "self_cache"
             } else {
+                self.report.negative_cache_hits += 1;
                 "miss"
             };
             self.record(entry_node, source, cached.length().map(u64::from));
@@ -677,10 +681,10 @@ impl ModeledCluster {
     pub fn observation(&self) -> ClusterObservation {
         let mut metrics = NodeMetricsSnapshot::default();
         for node in &self.retired_nodes {
-            add_metrics(&mut metrics, node.metrics);
+            metrics.merge(&node.metrics);
         }
         for node in &self.nodes {
-            add_metrics(&mut metrics, node.metrics);
+            metrics.merge(&node.metrics);
         }
         ClusterObservation {
             requests: self.report.requests,
@@ -694,7 +698,12 @@ impl ModeledCluster {
             membership_extra_peer_refs: 0,
             membership_min_peer_count: self.nodes.len(),
             membership_max_peer_count: self.nodes.len(),
-            cache_hits: self.report.l1_cache_hits,
+            cache_hits: self
+                .report
+                .l1_cache_hits
+                .saturating_add(self.report.negative_cache_hits),
+            l1_cache_hits: self.report.l1_cache_hits,
+            negative_cache_hits: self.report.negative_cache_hits,
             by_source: self.report.by_source.clone(),
             node_requests: self
                 .nodes
@@ -737,12 +746,12 @@ impl ModeledCluster {
             .nodes
             .iter()
             .map(|node| {
-                add_metrics(&mut metrics, node.metrics);
+                metrics.merge(&node.metrics);
                 modeled_node_report(node, true)
             })
             .collect();
         for node in &self.retired_nodes {
-            add_metrics(&mut metrics, node.metrics);
+            metrics.merge(&node.metrics);
         }
         self.report.backend_bytes = self
             .retired_nodes
@@ -873,6 +882,29 @@ mod tests {
         assert_eq!(report.metrics.backend_fetches, 2);
         assert!(report.tile_cache_bytes >= 128 * 1024);
         assert!(report.chunk_cache_bytes <= 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn observations_split_positive_and_negative_l1_hits() {
+        let (entry, mut catalog) = tile_fixture();
+        let key = tile_key(&entry).expect("tile key");
+        catalog.entries.insert(key, None);
+        let mut cluster = ModeledCluster::new(
+            ClusterConfig {
+                node_count: 1,
+                ..ClusterConfig::default()
+            },
+            catalog,
+        )
+        .expect("modeled cluster");
+
+        cluster.serve(&entry).expect("cold negative request");
+        cluster.serve(&entry).expect("negative cache hit");
+        let observation = cluster.observation();
+
+        assert_eq!(observation.l1_cache_hits, 0);
+        assert_eq!(observation.negative_cache_hits, 1);
+        assert_eq!(observation.cache_hits, 1);
     }
 
     #[test]

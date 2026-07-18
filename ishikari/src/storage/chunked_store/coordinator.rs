@@ -3,7 +3,10 @@
 use std::{
     collections::{BTreeSet, HashMap},
     ops::Range,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -25,6 +28,11 @@ use super::{
 const IMMEDIATE_CHUNK_INDEX: u64 = 0;
 const MAX_CHUNK_GAP: u64 = 1;
 const MAX_CONCURRENT_FETCHES_PER_TILESET: usize = 32;
+/// Total time a single admitted request may spend waiting for its chunks
+/// (queue + dispatch + backend read). Counts queue time, unlike the per-range
+/// backend timeout that starts only after an execution permit is acquired, so a
+/// request cannot wait behind a saturated backend without a deadline.
+const REQUEST_FETCH_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Coordinates shared inflight chunk fetches.
 #[derive(Clone)]
@@ -35,6 +43,41 @@ pub struct ChunkFetchCoordinator {
     merge_window: Duration,
     /// Per-tileset fetch state keyed by tileset id.
     tileset_states: Arc<Mutex<HashMap<TilesetId, TilesetFetchState>>>,
+    /// Count of admitted (in-flight) `fetch_chunks` requests, and the ceiling
+    /// above which new requests are shed. Backend *execution* concurrency is
+    /// bounded separately; this bounds admitted work — coordinator state,
+    /// waiters, and detached tasks — so distinct cold tilesets cannot grow it
+    /// without limit under a slow backend.
+    admitted_fetches: Arc<AtomicUsize>,
+    max_admitted_fetches: usize,
+}
+
+/// RAII reservation in the admitted-fetch counter. Reserving fails (a shed)
+/// when the counter is already at its ceiling. Sender-side waiters retain it
+/// across request cancellation, and it releases when the associated detached
+/// work has actually delivered or discarded every result.
+struct AdmittedFetchGuard {
+    admitted: Arc<AtomicUsize>,
+}
+
+impl AdmittedFetchGuard {
+    fn reserve(admitted: &Arc<AtomicUsize>, max: usize) -> Option<Self> {
+        let previous = admitted.fetch_add(1, Ordering::AcqRel);
+        if previous >= max {
+            admitted.fetch_sub(1, Ordering::AcqRel);
+            None
+        } else {
+            Some(Self {
+                admitted: Arc::clone(admitted),
+            })
+        }
+    }
+}
+
+impl Drop for AdmittedFetchGuard {
+    fn drop(&mut self) {
+        self.admitted.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Inflight and pending fetch coordination state for a single tileset.
@@ -47,7 +90,7 @@ struct TilesetFetchState {
     /// Chunks currently being fetched from the backend.
     inflight_chunks: BTreeSet<u64>,
     /// Per-chunk waiters that are released when the shared fetch completes.
-    waiters: HashMap<u64, Vec<oneshot::Sender<Result<Bytes, ChunkFetchError>>>>,
+    waiters: HashMap<u64, Vec<ChunkWaiter>>,
     /// Whether the per-tileset scheduler task is currently running.
     scheduler_running: bool,
     /// Number of backend fetches currently inflight for this tileset.
@@ -71,6 +114,15 @@ struct EnqueuedChunk {
     chunk_index: u64,
     receiver: oneshot::Receiver<Result<Bytes, ChunkFetchError>>,
     outcome: EnqueueOutcome,
+}
+
+/// Sender-side waiter that retains the request's admission reservation until
+/// the detached backend work actually releases it. If the HTTP future times
+/// out or is cancelled, dropping its receiver must not make the slot reusable
+/// while the scheduler/fetch task is still queued.
+struct ChunkWaiter {
+    sender: oneshot::Sender<Result<Bytes, ChunkFetchError>>,
+    _admission: Arc<AdmittedFetchGuard>,
 }
 
 impl EnqueueOutcome {
@@ -121,12 +173,19 @@ impl TilesetFetchState {
         &mut self,
         required_chunks: &[u64],
         queued_at: Instant,
+        admission: &Arc<AdmittedFetchGuard>,
     ) -> Vec<EnqueuedChunk> {
         let mut joined = Vec::with_capacity(required_chunks.len());
         for &chunk_index in required_chunks {
             let (tx, rx) = oneshot::channel();
             // Each caller waits on its own oneshot, but the backend fetch is shared.
-            self.waiters.entry(chunk_index).or_default().push(tx);
+            self.waiters
+                .entry(chunk_index)
+                .or_default()
+                .push(ChunkWaiter {
+                    sender: tx,
+                    _admission: Arc::clone(admission),
+                });
             let outcome = if self.inflight_chunks.contains(&chunk_index) {
                 EnqueueOutcome::JoinedInflight
             } else if self.pending_chunks.insert(chunk_index) {
@@ -220,7 +279,7 @@ impl TilesetFetchState {
                     Err(error) => Err(error.clone()),
                 };
                 for waiter in waiters {
-                    let _ = waiter.send(chunk_result.clone());
+                    let _ = waiter.sender.send(chunk_result.clone());
                 }
             }
         }
@@ -233,6 +292,7 @@ impl ChunkFetchCoordinator {
         fetcher: ChunkFetcher,
         max_fetch_chunks: u64,
         merge_window: Duration,
+        max_admitted_fetches: usize,
         metrics: NodeMetrics,
     ) -> Self {
         metrics.set_chunk_fetch_merge_window(merge_window);
@@ -242,6 +302,8 @@ impl ChunkFetchCoordinator {
             max_fetch_chunks,
             merge_window,
             tileset_states: Arc::new(Mutex::new(HashMap::new())),
+            admitted_fetches: Arc::new(AtomicUsize::new(0)),
+            max_admitted_fetches: max_admitted_fetches.max(1),
         }
     }
 
@@ -265,6 +327,18 @@ impl ChunkFetchCoordinator {
         required_chunks: &[u64],
         archive_len: u64,
     ) -> std::result::Result<HashMap<u64, Bytes>, ChunkFetchError> {
+        // Reserve an admitted-fetch slot before registering any coordinator
+        // state, so a flood of distinct cold tilesets cannot grow the state
+        // map, waiter set, and detached tasks without bound under a slow
+        // backend. Overload is shed (503), not queued. The guard is held until
+        // this request's chunks resolve and releases on any early return.
+        let admission = Arc::new(
+            AdmittedFetchGuard::reserve(&self.admitted_fetches, self.max_admitted_fetches)
+                .ok_or_else(|| {
+                    ChunkFetchError::Overload("backend fetch admission is saturated".into())
+                })?,
+        );
+
         let mut receivers = Vec::with_capacity(required_chunks.len());
         let queued_at = Instant::now();
 
@@ -274,7 +348,7 @@ impl ChunkFetchCoordinator {
             let was_idle = tileset_state.is_idle();
             tileset_state.archive_len = tileset_state.archive_len.max(archive_len);
 
-            for enqueued in tileset_state.enqueue_chunks(required_chunks, queued_at) {
+            for enqueued in tileset_state.enqueue_chunks(required_chunks, queued_at, &admission) {
                 self.metrics
                     .record_chunk_fetch_wait(enqueued.outcome.metric_label());
                 receivers.push((enqueued.chunk_index, enqueued.receiver));
@@ -298,14 +372,24 @@ impl ChunkFetchCoordinator {
         }
 
         let mut chunks = HashMap::with_capacity(receivers.len());
-        for (chunk_index, receiver) in receivers {
-            let result = receiver.await.map_err(|_| {
-                ChunkFetchError::Message(anyhow!("chunk fetch waiter dropped").to_string())
-            })?;
-            chunks.insert(chunk_index, result?);
+        // Bound the total wait (queue + dispatch + backend read) from enqueue so
+        // a request cannot block indefinitely behind a saturated backend.
+        let collect = async {
+            for (chunk_index, receiver) in receivers {
+                let result = receiver.await.map_err(|_| {
+                    ChunkFetchError::Message(anyhow!("chunk fetch waiter dropped").to_string())
+                })?;
+                chunks.insert(chunk_index, result?);
+            }
+            Ok(chunks)
+        };
+        match time::timeout(REQUEST_FETCH_DEADLINE, collect).await {
+            Ok(result) => result,
+            Err(_) => Err(ChunkFetchError::Timeout(format!(
+                "backend chunk fetch exceeded the {}s request deadline",
+                REQUEST_FETCH_DEADLINE.as_secs()
+            ))),
         }
-
-        Ok(chunks)
     }
 
     async fn run_scheduler(
@@ -473,23 +557,71 @@ mod tests {
         values.iter().copied().collect()
     }
 
+    fn test_admission() -> Arc<AdmittedFetchGuard> {
+        Arc::new(
+            AdmittedFetchGuard::reserve(&Arc::new(AtomicUsize::new(0)), 1).expect("test admission"),
+        )
+    }
+
+    #[test]
+    fn admitted_fetch_guard_sheds_above_the_ceiling_and_releases_on_drop() {
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let first = AdmittedFetchGuard::reserve(&admitted, 2).expect("first admitted");
+        let second = AdmittedFetchGuard::reserve(&admitted, 2).expect("second admitted");
+        assert_eq!(admitted.load(Ordering::Acquire), 2);
+        // At the ceiling: the next request is shed, and the failed reservation
+        // does not leak a slot.
+        assert!(AdmittedFetchGuard::reserve(&admitted, 2).is_none());
+        assert_eq!(admitted.load(Ordering::Acquire), 2);
+        drop(second);
+        assert_eq!(admitted.load(Ordering::Acquire), 1);
+        // A slot freed by drop is immediately reusable.
+        let third = AdmittedFetchGuard::reserve(&admitted, 2).expect("slot reused after drop");
+        assert_eq!(admitted.load(Ordering::Acquire), 2);
+        drop(first);
+        drop(third);
+        assert_eq!(admitted.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn cancelled_receiver_keeps_admission_until_detached_work_finishes() {
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let admission =
+            Arc::new(AdmittedFetchGuard::reserve(&admitted, 1).expect("request is admitted"));
+        let mut state = TilesetFetchState::default();
+        let receivers = state.enqueue_chunks(&[7], Instant::now(), &admission);
+
+        // Model an HTTP timeout/cancellation: both the request-side receiver
+        // and its local guard disappear while the detached fetch remains.
+        drop(receivers);
+        drop(admission);
+        assert_eq!(admitted.load(Ordering::Acquire), 1);
+        assert!(AdmittedFetchGuard::reserve(&admitted, 1).is_none());
+
+        let _ = state.select_dispatch_groups(1);
+        state.complete_group(7..8, &Ok(HashMap::from([(7, Bytes::new())])));
+        assert_eq!(admitted.load(Ordering::Acquire), 0);
+        assert!(AdmittedFetchGuard::reserve(&admitted, 1).is_some());
+    }
+
     #[test]
     fn enqueue_queues_new_chunks_then_joins_existing() {
         let mut state = TilesetFetchState::default();
         let now = Instant::now();
 
-        let queued = state.enqueue_chunks(&[5], now);
+        let admission = test_admission();
+        let queued = state.enqueue_chunks(&[5], now, &admission);
         assert!(matches!(queued[0].outcome, EnqueueOutcome::Queued));
         assert!(state.pending_chunks.contains(&5));
         assert!(state.first_pending_at.is_some());
 
         // A second waiter for the same still-pending chunk joins it.
-        let joined = state.enqueue_chunks(&[5], now);
+        let joined = state.enqueue_chunks(&[5], now, &admission);
         assert!(matches!(joined[0].outcome, EnqueueOutcome::JoinedPending));
 
         // A chunk already inflight is joined, not re-queued.
         state.inflight_chunks.insert(9);
-        let inflight = state.enqueue_chunks(&[9], now);
+        let inflight = state.enqueue_chunks(&[9], now, &admission);
         assert!(matches!(
             inflight[0].outcome,
             EnqueueOutcome::JoinedInflight
@@ -500,7 +632,7 @@ mod tests {
     #[test]
     fn select_dispatch_moves_pending_to_inflight() {
         let mut state = TilesetFetchState::default();
-        state.enqueue_chunks(&[1, 2, 3], Instant::now());
+        state.enqueue_chunks(&[1, 2, 3], Instant::now(), &test_admission());
 
         let DispatchDecision::Dispatch { groups, .. } = state.select_dispatch_groups(4) else {
             panic!("expected a dispatch");
@@ -515,7 +647,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn queue_delay_follows_tokio_virtual_time() {
         let mut state = TilesetFetchState::default();
-        state.enqueue_chunks(&[1], Instant::now());
+        state.enqueue_chunks(&[1], Instant::now(), &test_admission());
 
         time::advance(Duration::from_millis(10)).await;
 
@@ -543,7 +675,7 @@ mod tests {
     fn complete_group_releases_waiters_and_drains() {
         let mut state = TilesetFetchState::default();
         let mut receivers: Vec<_> = state
-            .enqueue_chunks(&[1, 2], Instant::now())
+            .enqueue_chunks(&[1, 2], Instant::now(), &test_admission())
             .into_iter()
             .map(|enqueued| enqueued.receiver)
             .collect();
@@ -576,7 +708,7 @@ mod tests {
             ..Default::default()
         };
         state.inflight_chunks.insert(1);
-        state.enqueue_chunks(&[2], Instant::now());
+        state.enqueue_chunks(&[2], Instant::now(), &test_admission());
 
         let DispatchDecision::Throttled(capacity_available) = state.select_dispatch_groups(4)
         else {

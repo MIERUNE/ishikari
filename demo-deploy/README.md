@@ -26,6 +26,9 @@ Build and push the demo image:
 gcloud builds submit --config demo-deploy/cloudbuild.yaml .
 ```
 
+The build imports and refreshes the BuildKit cache stored in Artifact Registry
+as `ishikari-buildcache:latest`; the first build starts with an empty cache.
+
 Create or bind the GCS reader identity once:
 
 ```sh
@@ -113,12 +116,16 @@ forwarding live on a separate cluster-internal port (`:9090`) that the Service
 does not expose and the Gateway does not route, so nothing internal is reachable
 publicly. The shared Gateway listens on HTTPS only.
 
-**Trust boundary:** the internal port is not network-isolated. With no
-NetworkPolicy, any pod anywhere in the cluster (not just the `map-demo`
-namespace) that can route to a pod IP can reach `:9090/_internal/*` and gossip
-`:7946`. The demo cluster is assumed to host only trusted workloads. Add a
-NetworkPolicy restricting `:9090`/`:7946` ingress to peer pods if you need
-in-cluster isolation.
+**Trust boundary:** the base NetworkPolicy keeps public HTTP (`:8080`) reachable
+while restricting peer HTTP (`:9090`) and gossip (`:7946/UDP`) to Ishikari pods
+in the same namespace. The GKE overlay separately permits Managed Prometheus to
+scrape `:9090`. Gossip and peer HTTP are not application-authenticated, so keep
+the NetworkPolicy enabled and treat pods carrying `app: ishikari` as trusted.
+
+Replicas use a hard hostname spread and a preferred zone spread, and the PDB
+allows at most one voluntary disruption. The server's 20-second end-to-end HTTP
+deadline plus the two-second drain propagation delay fits GKE Autopilot's
+25-second maximum grace period for Spot pods.
 
 ## Checks
 

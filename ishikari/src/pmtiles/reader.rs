@@ -30,6 +30,10 @@ pub enum StorageError {
     /// without matching on the message string.
     #[error("{0}")]
     Timeout(String),
+    /// Backend fetch admission is saturated; the request is shed. Typed so the
+    /// service layer maps it to a 503 without matching on the message string.
+    #[error("{0}")]
+    Overload(String),
     #[error("{0}")]
     Message(String),
 }

@@ -1,6 +1,7 @@
 //! Shared bounded upstream fetch helpers for provider resources.
 
 use std::{
+    future::Future,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -25,7 +26,7 @@ use crate::{
         provider_body::{
             BodyValidation, decode_provider_body, validate_body, validate_content_type,
         },
-        provider_cache_policy::{CachePolicy, cache_policy, has_explicit_freshness},
+        provider_cache_policy::{CachePolicy, cache_policy},
     },
     singleflight::{Flight, LeaderGuard, SingleFlight},
     storage::{
@@ -39,11 +40,18 @@ const PROVIDER_RESOURCE_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 /// bodies process-wide so many distinct URLs cannot bypass per-key
 /// single-flight and consume unbounded memory.
 const PROVIDER_FETCH_CONCURRENCY: usize = 16;
+/// Foreground cache misses, including single-flight followers. Reserve before
+/// joining a flight so a hot-key flood cannot retain unbounded request tasks.
+const PROVIDER_REQUEST_MAX_INFLIGHT: usize = 128;
+/// Distinct origin operations, including background revalidations. This is
+/// separate from foreground request admission because stale hits return before
+/// their refresh completes.
 const PROVIDER_FETCH_MAX_INFLIGHT: usize = 128;
 const NEGATIVE_TTL: Duration = Duration::from_secs(30);
 /// Bounded so a slow or hung upstream cannot pin request tasks indefinitely
 /// (mirrors the tile backend fetch timeout).
 const PROVIDER_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+const PROVIDER_JSON_VALIDATION_WORK: &str = "provider_json_validation";
 
 #[derive(Clone)]
 enum ProviderFlightOutcome {
@@ -72,7 +80,11 @@ enum ProviderOriginOutcome {
 #[derive(Clone)]
 struct CachedProviderRepresentation {
     bytes: Bytes,
-    cache_control: Arc<str>,
+    /// The effective policy decided at the original fetch, carried verbatim so a
+    /// headerless `304` reuses the same freshness/SWR/explicit-freshness
+    /// decision instead of re-parsing the normalized downstream header (which
+    /// would misread the resource default as an origin-declared lifetime).
+    policy: CachePolicy,
     validators: Validators,
     content_encoding: Option<Arc<str>>,
 }
@@ -213,6 +225,31 @@ impl ProviderResource {
         response
     }
 
+    /// Builds a byte-identical public provider response, including conditional
+    /// handling and the representation's cache/encoding metadata.
+    pub(crate) fn verbatim_public_response(
+        &self,
+        request: &HeaderMap,
+        content_type: &'static str,
+    ) -> axum::response::Response {
+        if self.not_modified(request) {
+            return self.not_modified_response();
+        }
+        let mut response = super::bytes_response(self.bytes.clone(), content_type, None);
+        self.apply_public_headers(response.headers_mut());
+        response
+    }
+
+    /// Builds the peer-facing form of a byte-identical provider response.
+    pub(crate) fn verbatim_internal_response(
+        &self,
+        content_type: &'static str,
+    ) -> axum::response::Response {
+        let mut response = super::bytes_response(self.bytes.clone(), content_type, None);
+        self.apply_internal_headers(response.headers_mut());
+        response
+    }
+
     pub(crate) fn apply_public_headers(&self, headers: &mut HeaderMap) {
         self.apply_cache_metadata(headers);
         self.apply_content_encoding(headers);
@@ -265,12 +302,37 @@ impl ProviderResource {
     }
 }
 
+/// Routes a provider resource to its HRW owner, falling back to the supplied
+/// local origin fetch when this node owns it or no peer can serve it.
+pub(crate) async fn route_or_fetch_provider(
+    state: &AppState,
+    routing_key: &str,
+    internal_path: &str,
+    resource: &'static str,
+    local_fetch: impl Future<Output = Result<ProviderResource, HttpError>>,
+) -> Result<ProviderResource, HttpError> {
+    match state
+        .resource_resolver
+        .route_provider_resource(routing_key, internal_path, resource)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("{resource} peer route failed: {error}"),
+            )
+        })? {
+        Some(response) => Ok(ProviderResource::from_peer(response)),
+        None => local_fetch.await,
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ProviderFetchCache {
     entries: Cache<ProviderFetchCacheKey, CachedProviderFetch>,
     inflight: SingleFlight<ProviderFetchCacheKey, ProviderFlightOutcome>,
     http_client: Client,
     fetch_semaphore: Arc<Semaphore>,
+    request_inflight: Arc<AtomicUsize>,
     fetch_inflight: Arc<AtomicUsize>,
 }
 
@@ -284,6 +346,7 @@ impl ProviderFetchCache {
             inflight: SingleFlight::default(),
             http_client: provider_http_client(),
             fetch_semaphore: Arc::new(Semaphore::new(PROVIDER_FETCH_CONCURRENCY)),
+            request_inflight: Arc::new(AtomicUsize::new(0)),
             fetch_inflight: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -325,7 +388,7 @@ impl ProviderFetchCache {
             key,
             CachedProviderFetch::Found {
                 bytes: fetched.bytes.clone(),
-                cache_control: Arc::clone(&fetched.policy.response_cache_control),
+                policy: fetched.policy.clone(),
                 validators: fetched.validators.clone(),
                 content_encoding: fetched.content_encoding.clone(),
                 age_at_insert: fetched.initial_age,
@@ -353,6 +416,16 @@ impl ProviderFetchCache {
         key: ProviderFetchCacheKey,
     ) -> Flight<ProviderFetchCacheKey, ProviderFlightOutcome> {
         self.inflight.begin(key)
+    }
+
+    fn admit_request(&self, resource: &'static str) -> Result<ProviderFetchSlot, HttpError> {
+        ProviderFetchSlot::try_reserve(&self.request_inflight, PROVIDER_REQUEST_MAX_INFLIGHT)
+            .ok_or_else(|| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("{resource} upstream request admission saturated"),
+                )
+            })
     }
 
     async fn admit_fetch(&self, resource: &'static str) -> Result<ProviderFetchPermit, HttpError> {
@@ -425,7 +498,7 @@ enum Freshness {
 enum CachedProviderFetch {
     Found {
         bytes: Bytes,
-        cache_control: Arc<str>,
+        policy: CachePolicy,
         validators: Validators,
         content_encoding: Option<Arc<str>>,
         age_at_insert: Duration,
@@ -466,7 +539,7 @@ impl CachedProviderFetch {
         match self {
             Self::Found {
                 bytes,
-                cache_control,
+                policy,
                 validators,
                 content_encoding,
                 age_at_insert,
@@ -474,7 +547,7 @@ impl CachedProviderFetch {
                 ..
             } => Ok(ProviderResource {
                 bytes,
-                cache_control,
+                cache_control: policy.response_cache_control,
                 age_seconds: Instant::now()
                     .saturating_duration_since(stored_at)
                     .saturating_add(age_at_insert)
@@ -498,13 +571,13 @@ impl CachedProviderFetch {
         match self {
             Self::Found {
                 bytes,
-                cache_control,
+                policy,
                 validators,
                 content_encoding,
                 ..
             } => Some(CachedProviderRepresentation {
                 bytes: bytes.clone(),
-                cache_control: Arc::clone(cache_control),
+                policy: policy.clone(),
                 validators: validators.clone(),
                 content_encoding: content_encoding.clone(),
             }),
@@ -668,6 +741,10 @@ async fn fetch_limited_bytes_with_validation(
     let key = ProviderFetchCacheKey::new(resource, &url, accepted_content_types, body_validation);
     let mut recorded_miss = false;
     let mut joined_singleflight = false;
+    // Kept across follower wakeups/re-elections so one HTTP miss consumes one
+    // slot until it returns, regardless of how many internal flight cycles an
+    // uncacheable response or cancelled leader causes.
+    let mut request_admission = None;
     loop {
         if let Some((entry, freshness)) = state.provider_fetch_cache.get(&key) {
             // A follower already recorded the request as a miss plus a join.
@@ -698,6 +775,9 @@ async fn fetch_limited_bytes_with_validation(
                 .metrics
                 .record_provider_resource_cache(resource, "miss");
             recorded_miss = true;
+        }
+        if request_admission.is_none() {
+            request_admission = Some(state.provider_fetch_cache.admit_request(resource)?);
         }
 
         match state.provider_fetch_cache.begin_fetch(key.clone()) {
@@ -782,13 +862,15 @@ async fn fetch_limited_bytes_uncached(
             }
         };
         if let ProviderOriginOutcome::Modified(fetched) = &fetched {
-            validate_body(
-                &fetched.bytes,
-                fetched.content_encoding.as_deref(),
+            validate_body_admitted(
+                state,
+                fetched.bytes.clone(),
+                fetched.content_encoding.clone(),
                 body_validation,
                 max_bytes,
                 resource,
-            )?;
+            )
+            .await?;
         }
         Ok(fetched)
     };
@@ -800,6 +882,48 @@ async fn fetch_limited_bytes_uncached(
                 format!("{resource} upstream timed out"),
             )
         })?
+}
+
+/// Runs bounded decompression and JSON parsing off the async runtime and under
+/// the same process-wide CPU admission used by other heavy transformations.
+/// Validation remains before cache insertion so malformed successful responses
+/// can never become shared provider entries.
+async fn validate_body_admitted(
+    state: &AppState,
+    body: Bytes,
+    content_encoding: Option<Arc<str>>,
+    validation: BodyValidation,
+    max_bytes: usize,
+    resource: &'static str,
+) -> Result<(), HttpError> {
+    if validation != BodyValidation::Json {
+        return Ok(());
+    }
+
+    // Light provider pool: JSON validation is millisecond-scale and must not
+    // queue behind (or be shed by) heavy terrain/MLT work.
+    let permit = state
+        .admit_provider_work(PROVIDER_JSON_VALIDATION_WORK)
+        .await?;
+    tokio::task::spawn_blocking(move || {
+        // A dropped JoinHandle does not cancel spawn_blocking. Keep admission
+        // until the CPU work itself finishes, including after request timeout.
+        let _permit = permit;
+        validate_body(
+            &body,
+            content_encoding.as_deref(),
+            validation,
+            max_bytes,
+            resource,
+        )
+    })
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{resource} JSON validation task failed"),
+        )
+    })?
 }
 
 async fn fetch_http_provider(
@@ -822,7 +946,10 @@ async fn fetch_http_provider(
     let mut response = request.send().await.map_err(|error| {
         (
             StatusCode::BAD_GATEWAY,
-            format!("{resource} upstream GET failed: {error}"),
+            // `without_url`: reqwest errors embed the request URL, and provider
+            // URLs can carry signed query strings that must not reach a public
+            // 502 body.
+            format!("{resource} upstream GET failed: {}", error.without_url()),
         )
     })?;
     let status = response.status();
@@ -846,7 +973,10 @@ async fn fetch_http_provider(
     if status == StatusCode::NOT_FOUND {
         return Err((StatusCode::NOT_FOUND, "not found".to_string()));
     }
-    if !status.is_success() {
+    // Only a plain `200` carries a complete representation. Other 2xx statuses
+    // (`204 No Content`, `206 Partial Content`, ...) would cache a truncated or
+    // empty body and serve it publicly as complete.
+    if status != StatusCode::OK {
         return Err((
             StatusCode::BAD_GATEWAY,
             format!("{resource} upstream returned {status}"),
@@ -869,13 +999,6 @@ async fn fetch_http_provider(
     )?;
     let cache_control = joined_header_values(&headers, header::CACHE_CONTROL);
     let policy = cache_policy(resource, cache_control.as_deref());
-    // Age accounting is only meaningful against an upstream-declared lifetime.
-    // When the upstream sets no explicit freshness, Ishikari applies its own
-    // default TTL, and charging the transported `Age`/`Date` against that
-    // invented lifetime would wrongly evict (a CDN-fronted body sending
-    // `Age: 900` but no `Cache-Control` would never cache). Match the
-    // object-store path and start the clock at fetch time in that case.
-    let has_explicit_freshness = has_explicit_freshness(cache_control.as_deref());
     let validators = Validators::new(
         header_value(&headers, header::ETAG).map(Arc::from),
         header_value(&headers, header::LAST_MODIFIED)
@@ -890,7 +1013,7 @@ async fn fetch_http_provider(
     while let Some(chunk) = response.chunk().await.map_err(|error| {
         (
             StatusCode::BAD_GATEWAY,
-            format!("{resource} upstream body failed: {error}"),
+            format!("{resource} upstream body failed: {}", error.without_url()),
         )
     })? {
         if body.len().saturating_add(chunk.len()) > max_bytes {
@@ -901,9 +1024,14 @@ async fn fetch_http_provider(
         }
         body.extend_from_slice(&chunk);
     }
-    // Include body transfer time because the entry cannot be served or stored
-    // until the complete bounded representation has arrived.
-    let initial_age = if has_explicit_freshness {
+    // Age accounting is only meaningful against an upstream-declared lifetime.
+    // When the upstream sets no explicit freshness, Ishikari applies its own
+    // default TTL, and charging the transported `Age`/`Date` against that
+    // invented lifetime would wrongly evict (a CDN-fronted body sending
+    // `Age: 900` but no `Cache-Control` would never cache). Include body
+    // transfer time because the entry cannot be served or stored until the
+    // complete bounded representation has arrived.
+    let initial_age = if policy.explicit_freshness {
         corrected_initial_age(&headers, SystemTime::now(), request_started.elapsed())
     } else {
         Duration::ZERO
@@ -928,12 +1056,9 @@ async fn fetch_object_store_provider(
 ) -> Result<ProviderOriginOutcome, HttpError> {
     // `gs://` and `s3://` authenticate with ambient credentials. The registry
     // reuses connection pools and credentials per bucket.
-    let (store, path) = registry.resolve(url).map_err(|error| {
-        (
-            StatusCode::BAD_GATEWAY,
-            format!("{resource} upstream store init failed: {error}"),
-        )
-    })?;
+    let (store, path) = registry
+        .resolve(url)
+        .map_err(|error| provider_object_store_error(resource, "store initialization", &error))?;
     let mut options = GetOptions::new();
     if let Some(cached) = revalidate {
         if let Some(etag) = cached.validators.etag() {
@@ -958,10 +1083,7 @@ async fn fetch_object_store_provider(
             return Err((StatusCode::NOT_FOUND, "not found".to_string()));
         }
         Err(other) => {
-            return Err((
-                StatusCode::BAD_GATEWAY,
-                format!("{resource} upstream GET failed: {other}"),
-            ));
+            return Err(provider_object_store_error(resource, "GET", &other));
         }
     };
     if result.meta.size > max_bytes as u64 {
@@ -996,12 +1118,10 @@ async fn fetch_object_store_provider(
         .map(|value| value.as_ref())
         .filter(|value| !value.trim().eq_ignore_ascii_case("identity"))
         .map(Arc::from);
-    let body = result.bytes().await.map_err(|error| {
-        (
-            StatusCode::BAD_GATEWAY,
-            format!("{resource} upstream body failed: {error}"),
-        )
-    })?;
+    let body = result
+        .bytes()
+        .await
+        .map_err(|error| provider_object_store_error(resource, "body", &error))?;
     if body.len() > max_bytes {
         return Err((
             StatusCode::BAD_GATEWAY,
@@ -1017,16 +1137,35 @@ async fn fetch_object_store_provider(
     }))
 }
 
+/// Converts an object-store failure to a stable public error without retaining
+/// its source. Backend errors can contain generated signed request URLs, so even
+/// wrapping the raw error in an anyhow chain would make later logging unsafe.
+fn provider_object_store_error<E>(
+    resource: &'static str,
+    operation: &'static str,
+    _error: &E,
+) -> HttpError {
+    (
+        StatusCode::BAD_GATEWAY,
+        format!("{resource} upstream {operation} failed"),
+    )
+}
+
 fn revalidated_provider_resource(
     cached: &CachedProviderRepresentation,
     resource: &'static str,
     headers: Option<&HeaderMap>,
     response_delay: Duration,
 ) -> FetchedProviderResource {
-    let cache_control = headers
+    // A `304` may restate the policy. When it carries a fresh `Cache-Control`,
+    // re-derive from it; otherwise reuse the original fetch's decision verbatim
+    // (freshness, SWR, and whether the origin declared explicit freshness).
+    // Re-parsing the stored *normalized* header instead would misread a
+    // defaulted or SWR-only response as an origin-declared lifetime.
+    let policy = headers
         .and_then(|headers| joined_header_values(headers, header::CACHE_CONTROL))
-        .unwrap_or_else(|| cached.cache_control.to_string());
-    let policy = cache_policy(resource, Some(&cache_control));
+        .map(|value| cache_policy(resource, Some(&value)))
+        .unwrap_or_else(|| cached.policy.clone());
     let validators = Validators::new(
         headers
             .and_then(|headers| header_value(headers, header::ETAG))
@@ -1043,9 +1182,16 @@ fn revalidated_provider_resource(
             Some(value) => Some(Arc::from(value.trim())),
             None => cached.content_encoding.clone(),
         };
-    let initial_age = headers.map_or(Duration::ZERO, |headers| {
-        corrected_initial_age(headers, SystemTime::now(), response_delay)
-    });
+    // Only charge the transported `Age`/`Date` against an origin-declared
+    // lifetime. When freshness is Ishikari's default (no `max-age`/`s-maxage`,
+    // e.g. an SWR-only origin), a 304's `Age` must not shorten it — mirrors the
+    // guard on the initial fetch path.
+    let initial_age = match headers {
+        Some(headers) if policy.explicit_freshness => {
+            corrected_initial_age(headers, SystemTime::now(), response_delay)
+        }
+        _ => Duration::ZERO,
+    };
     FetchedProviderResource {
         bytes: cached.bytes.clone(),
         policy,
@@ -1091,8 +1237,22 @@ fn corrected_initial_age(
 }
 
 fn provider_fetch_cache_weight(key: &ProviderFetchCacheKey, value: &CachedProviderFetch) -> u32 {
+    // Count every heap payload the entry retains, not just the body: the
+    // normalized `Cache-Control`, `Content-Encoding`, and ETag strings are all
+    // held per entry, so omitting them lets header-heavy responses accumulate
+    // past the configured cache ceiling.
     let value_size = match value {
-        CachedProviderFetch::Found { bytes, .. } => bytes.len(),
+        CachedProviderFetch::Found {
+            bytes,
+            policy,
+            validators,
+            content_encoding,
+            ..
+        } => bytes
+            .len()
+            .saturating_add(policy.response_cache_control.len())
+            .saturating_add(content_encoding.as_ref().map_or(0, |value| value.len()))
+            .saturating_add(validators.etag().map_or(0, str::len)),
         CachedProviderFetch::NotFound { .. } => 0,
     };
     let total = std::mem::size_of_val(key)
@@ -1112,10 +1272,10 @@ fn validation_key(accepted_content_types: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BodyValidation, CachedProviderFetch, FetchedProviderResource, Freshness,
-        ProviderFetchCache, ProviderFetchCacheKey, ProviderFetchSlot, ProviderResource, Validators,
-        cache_policy, corrected_initial_age, record_cached_provider_fetch,
-        revalidated_provider_resource,
+        BodyValidation, CachedProviderFetch, FetchedProviderResource, Flight, Freshness,
+        PROVIDER_REQUEST_MAX_INFLIGHT, ProviderFetchCache, ProviderFetchCacheKey,
+        ProviderFetchSlot, ProviderResource, Validators, cache_policy, corrected_initial_age,
+        provider_object_store_error, record_cached_provider_fetch, revalidated_provider_resource,
     };
     use crate::metrics::NodeMetrics;
     use crate::storage::{
@@ -1124,6 +1284,7 @@ mod tests {
     };
     use axum::http::{HeaderMap, StatusCode, header};
     use bytes::Bytes;
+    use object_store::Error as ObjectStoreError;
     use std::{
         sync::{
             Arc,
@@ -1133,6 +1294,22 @@ mod tests {
     };
 
     #[test]
+    fn object_store_provider_errors_never_expose_the_source() {
+        let secret = "SECRETTOKEN";
+        let error = ObjectStoreError::Generic {
+            store: "synthetic",
+            source: Box::new(std::io::Error::other(format!(
+                "GET https://bucket.example/object?X-Signature={secret}"
+            ))),
+        };
+
+        let (_, message) = provider_object_store_error("style", "GET", &error);
+        assert_eq!(message, "style upstream GET failed");
+        assert!(!message.contains(secret), "{message}");
+        assert!(!message.contains("bucket.example"), "{message}");
+    }
+
+    #[test]
     fn provider_fetch_slots_are_bounded_and_released_on_drop() {
         let inflight = Arc::new(AtomicUsize::new(0));
         let slot = ProviderFetchSlot::try_reserve(&inflight, 1).expect("first slot");
@@ -1140,6 +1317,40 @@ mod tests {
         assert_eq!(inflight.load(Ordering::Relaxed), 1);
         drop(slot);
         assert!(ProviderFetchSlot::try_reserve(&inflight, 1).is_some());
+    }
+
+    #[test]
+    fn provider_request_admission_bounds_same_key_followers() {
+        let cache = ProviderFetchCache::new();
+        let key = ProviderFetchCacheKey::new(
+            "style",
+            "https://assets.example/slow-style.json",
+            &["application/json"],
+            BodyValidation::Json,
+        );
+        let mut slots = vec![cache.admit_request("style").expect("leader admitted")];
+        let leader = match cache.begin_fetch(key.clone()) {
+            Flight::Leader(leader) => leader,
+            Flight::Follower(_) => panic!("first request must lead"),
+        };
+        for _ in 1..PROVIDER_REQUEST_MAX_INFLIGHT {
+            slots.push(cache.admit_request("style").expect("follower admitted"));
+            assert!(matches!(
+                cache.begin_fetch(key.clone()),
+                Flight::Follower(_)
+            ));
+        }
+
+        let error = match cache.admit_request("style") {
+            Ok(_) => panic!("request above the follower ceiling must be shed"),
+            Err(error) => error,
+        };
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(error.1.contains("request admission saturated"));
+
+        drop(leader);
+        drop(slots);
+        assert!(cache.admit_request("style").is_ok());
     }
 
     #[test]
@@ -1161,7 +1372,10 @@ mod tests {
     fn not_modified_reuses_body_and_refreshes_origin_metadata() {
         let cached = CachedProviderFetch::Found {
             bytes: Bytes::from_static(b"validated-style"),
-            cache_control: "public, max-age=0, s-maxage=0, stale-while-revalidate=60".into(),
+            policy: cache_policy(
+                "style",
+                Some("public, max-age=0, stale-while-revalidate=60"),
+            ),
             validators: Validators::new(Some("\"v1\"".into()), None),
             content_encoding: Some("gzip".into()),
             age_at_insert: Duration::from_secs(40),
@@ -1188,8 +1402,15 @@ mod tests {
         );
 
         assert_eq!(refreshed.bytes.as_ref(), b"validated-style");
+        // The 304 restated an explicit lifetime, so the policy is re-derived
+        // from it (not inherited).
         assert_eq!(refreshed.policy.fresh, Duration::from_secs(120));
         assert_eq!(refreshed.policy.swr, Duration::from_secs(30));
+        assert!(refreshed.policy.explicit_freshness);
+        assert_eq!(
+            refreshed.policy.response_cache_control.as_ref(),
+            "public, max-age=120, s-maxage=120, stale-while-revalidate=30"
+        );
         assert_eq!(refreshed.validators.etag(), Some("\"v2\""));
         assert_eq!(refreshed.content_encoding.as_deref(), Some("gzip"));
         assert!(refreshed.initial_age < Duration::from_secs(1));
@@ -1198,6 +1419,79 @@ mod tests {
         let identity =
             revalidated_provider_resource(&cached, "style", Some(&headers), Duration::ZERO);
         assert_eq!(identity.content_encoding, None);
+    }
+
+    #[test]
+    fn headerless_not_modified_preserves_defaulted_internal_ttl() {
+        // The cached response advertises a longer downstream shared-cache
+        // policy, but the origin sent no Cache-Control on the original 200.
+        // A headerless 304 must therefore reapply the 5-minute local default,
+        // not parse the advertised one as if it came from the origin.
+        let cached = CachedProviderFetch::Found {
+            bytes: Bytes::from_static(b"validated-style"),
+            policy: cache_policy("style", None),
+            validators: Validators::new(Some("\"v1\"".into()), None),
+            content_encoding: None,
+            age_at_insert: Duration::ZERO,
+            stored_at: std::time::Instant::now(),
+            fresh_until: std::time::Instant::now(),
+            stale_until: std::time::Instant::now(),
+        }
+        .representation()
+        .expect("found representation");
+
+        let refreshed = revalidated_provider_resource(&cached, "style", None, Duration::ZERO);
+
+        assert_eq!(refreshed.policy.fresh, Duration::from_secs(300));
+        assert_eq!(refreshed.policy.swr, Duration::ZERO);
+        assert!(!refreshed.policy.explicit_freshness);
+        // The advertised downstream policy is still the longer default; only the
+        // internal freshness stays at the 5-minute local default.
+        assert_eq!(
+            refreshed.policy.response_cache_control.as_ref(),
+            "public, max-age=300, s-maxage=3600, stale-while-revalidate=86400"
+        );
+    }
+
+    #[test]
+    fn swr_only_not_modified_does_not_charge_age_against_default_freshness() {
+        // An SWR-only origin (no `max-age`/`s-maxage`) keeps Ishikari's default
+        // freshness but a non-zero SWR window, so its 304 is reachable. A
+        // transported `Age` must not be charged against that invented default
+        // freshness — otherwise the entry expires immediately on revalidation.
+        let cached = CachedProviderFetch::Found {
+            bytes: Bytes::from_static(b"validated-style"),
+            policy: cache_policy("style", Some("stale-while-revalidate=86400")),
+            validators: Validators::new(Some("\"v1\"".into()), None),
+            content_encoding: None,
+            age_at_insert: Duration::ZERO,
+            stored_at: std::time::Instant::now(),
+            fresh_until: std::time::Instant::now(),
+            stale_until: std::time::Instant::now() + Duration::from_secs(86400),
+        }
+        .representation()
+        .expect("found representation");
+        assert!(!cached.policy.explicit_freshness);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AGE, "900".parse().unwrap());
+        // 304 restates only the SWR window, still no explicit freshness.
+        headers.insert(
+            header::CACHE_CONTROL,
+            "stale-while-revalidate=86400".parse().unwrap(),
+        );
+
+        let refreshed = revalidated_provider_resource(
+            &cached,
+            "style",
+            Some(&headers),
+            Duration::from_millis(10),
+        );
+
+        assert_eq!(refreshed.policy.fresh, Duration::from_secs(300));
+        assert!(!refreshed.policy.explicit_freshness);
+        // The `Age: 900` header is ignored because freshness is the default.
+        assert_eq!(refreshed.initial_age, Duration::ZERO);
     }
 
     #[test]
@@ -1225,7 +1519,7 @@ mod tests {
         let fresh_until = stored_at + Duration::from_secs(60);
         let entry = CachedProviderFetch::Found {
             bytes: Bytes::from_static(b"style"),
-            cache_control: "public, max-age=60".into(),
+            policy: cache_policy("style", Some("public, max-age=60")),
             validators: Validators::default(),
             content_encoding: None,
             age_at_insert: Duration::ZERO,
@@ -1433,7 +1727,7 @@ mod tests {
         let now = std::time::Instant::now();
         let entry = CachedProviderFetch::Found {
             bytes: Bytes::from_static(b"x"),
-            cache_control: "public, max-age=60".into(),
+            policy: cache_policy("style", Some("public, max-age=60")),
             validators: Validators::default(),
             content_encoding: None,
             age_at_insert: Duration::ZERO,
@@ -1446,7 +1740,7 @@ mod tests {
 
         let expired = CachedProviderFetch::Found {
             bytes: Bytes::from_static(b"x"),
-            cache_control: "public, max-age=60".into(),
+            policy: cache_policy("style", Some("public, max-age=60")),
             validators: Validators::default(),
             content_encoding: None,
             age_at_insert: Duration::ZERO,

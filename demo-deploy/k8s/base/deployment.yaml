@@ -30,7 +30,27 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
+      # GKE Autopilot caps Spot pods at 25s. Ishikari applies a 20s end-to-end
+      # HTTP deadline and spends 2s propagating drain state, leaving 3s before
+      # the platform's SIGKILL boundary.
       terminationGracePeriodSeconds: 25
+      topologySpreadConstraints:
+        # Two HPA replicas must not collapse onto one failure domain. A hard
+        # hostname constraint preserves availability across node loss; zone is
+        # a preference so a temporarily single-zone cluster can still start.
+        - maxSkew: 1
+          minDomains: 2
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: ishikari
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: ishikari
       containers:
         - name: ishikari
           image: ishikari:dev
@@ -45,6 +65,7 @@ spec:
               containerPort: 9090
             - name: gossip
               containerPort: 7946
+              protocol: UDP
           env:
             - name: POD_IP
               valueFrom:
